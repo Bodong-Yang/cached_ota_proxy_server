@@ -14,7 +14,7 @@ from . import db
 
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  
 
 
 def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
@@ -41,12 +41,13 @@ class OTAFile:
         meta: db.CacheMeta = None,
         store_cache: bool = False,
         enable_https: bool = False,
+        free_space_event: Event = None
     ):
-
         self.base_path = base_path
         self._session = session
         self._cached = False
         self._store_cache = store_cache
+        self._free_space_event = free_space_event
 
         # cache entry meta
         self.url = url
@@ -103,6 +104,11 @@ class OTAFile:
             self._dst_fp = open(tmp_fpath, "wb")
 
             while not self._finished or not self._queue.empty():
+                if not self._free_space_event.is_set():
+                    # if the free space is not enough duing caching
+                    # abort the caching
+                    break
+
                 data = self._queue.get(timeout=3)
                 self._hash_f.update(data)
                 self.size += self._dst_fp.write(data)
@@ -148,7 +154,7 @@ class OTAFile:
 
 
 class OTACache:
-    CACHE_DIR = "/ota-cache"
+    CACHE_DIR = "/run/test/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
     DISK_USE_LIMIT_P = 80  # in p%
     DISK_USE_PULL_INTERVAL = 2 # in seconds
@@ -165,28 +171,27 @@ class OTACache:
     )  # Bytes
 
     def __init__(self, cache_enabled: bool, init: bool, upper_proxy: str = None):
+        logger.debug("init ota cache...")
+        
         self._closed = False
         self._cache_enabled = cache_enabled
         self._gateway_proxy = upper_proxy is None
+        self._executor = ThreadPoolExecutor()
 
         self._enough_free_space = Event()
 
         if cache_enabled:
             self._cache_enabled = True
-            self._executor = ThreadPoolExecutor()
             
-            cmd = f"findmnt -o SOURCE -n {self.CACHE_DIR}"
-            self._cache_dev = _subprocess_check_output(cmd, raise_exception=True)
+            # prepare cache dire
+            if init:
+                shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
+            Path(self.CACHE_DIR).mkdir(exist_ok=True)
 
             # dispatch a background task to pulling the disk usage info
             self._executor.submit(
                 self._background_check_free_space
             )
-
-            # prepare cache dire
-            if init:
-                shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
-            Path(self.CACHE_DIR).mkdir(exist_ok=True)
 
             self._db = db.OTACacheDB(self.DB_FILE)
             # NOTE: requests doesn't decompress the contents,
@@ -202,21 +207,23 @@ class OTACache:
             self._cache_enabled = False
 
     def close(self, cleanup: bool = False):
+        logger.debug("cleanup ota-cache...")
         if self._cache_enabled and not self._closed:
             self._closed = True
-            self._executor.shutdown(wait=True)
+            self._executor.shutdown()
             self._db.close()
 
             if cleanup:
                 shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
 
-    def __del__(self):
-        self.close()
+    def _ensure_server_running(self):
+        while True:
+            time.sleep(1)
 
     def _background_check_free_space(self) -> bool:
         while not self._closed:
             try:
-                cmd = f"df --output=pcent {self._cache_dev}"
+                cmd = f"df --output=pcent {self.CACHE_DIR}"
                 current_used_p = _subprocess_check_output(cmd, raise_exception=True)
 
                 # expected output:
@@ -225,6 +232,8 @@ class OTACache:
                 current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
                 if current_used_p < self.DISK_USE_LIMIT_P:
                     self._enough_free_space.set()
+                else:
+                    self._enough_free_space.clear()
             except Exception:
                 self._enough_free_space.clear()
             
@@ -241,8 +250,15 @@ class OTACache:
     def _register_cache_callback(self, f: OTAFile):
         """
         the callback for finishing up caching
+
+        NOTE: 
+        1. if the free space is used up duing caching,
+        the caching will terminate immediately.
+        2. if the free space is used up after cache writing finished,
+        we will first try reserving free space, if fails, 
+        then we delete the already cached file.
         """
-        if f.cached_success:
+        if f.cached_success and self._ensure_free_space(f.size):
             bucket = self._find_target_bucket_size(f.size)
             with self._bucket_locks[bucket]:  # only lock specific bucket
                 # regist the file, append to the bucket
@@ -353,7 +369,7 @@ class OTACache:
             pass
 
     # exposed API
-    async def retrieve_file(self, url: str, size: int) -> OTAFile:
+    async def retrieve_file(self, url: str) -> OTAFile:
         if self._closed:
             raise ValueError("ota cache pool is closed")
 
@@ -384,23 +400,21 @@ class OTACache:
             if new_cache:
                 # case 2: download and cache new file
                 # try to ensure space for new cache
-                store_cache = self._ensure_free_space(size)
                 res = OTAFile(
                     url=url,
                     base_path=self.CACHE_DIR,
                     session=self._session,
-                    store_cache=store_cache,
+                    store_cache=True,
                     enable_https=self._gateway_proxy,
                 )
 
-                if store_cache:
-                    # dispatch the background cache writing to executor
-                    loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
-                        self._executor,
-                        res.background_write_cache,
-                        self._register_cache_callback,
-                    )
+                # dispatch the background cache writing to executor
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
+                    self._executor,
+                    res.background_write_cache,
+                    self._register_cache_callback,
+                )
             else:
                 # case 3: use cache
                 # warm up the cache

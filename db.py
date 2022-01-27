@@ -37,14 +37,18 @@ class OTACacheDB:
     }
 
     def __init__(self, db_file: str, init: bool = False):
+        logger.debug("init database...")
         self._db_file = db_file
         self._wlock = Lock()
         self._closed = False
 
         self._connect_db(init)
 
-    def __del__(self):
-        self.close()
+    def close(self):
+        logger.debug("closing db...")
+        if not self._closed:
+            self._con.close()
+            self._closed = True
 
     def _init_table(self):
         cur = self._con.cursor()
@@ -132,8 +136,3 @@ class OTACacheDB:
             content_encoding=row[self.COLUMNS["content_encoding"]],
         )
         return res
-
-    def close(self):
-        if not self._closed:
-            self._con.close()
-            self._closed = True
