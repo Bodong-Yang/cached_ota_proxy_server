@@ -7,7 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from hashlib import sha256
-from threading import Lock
+from threading import Lock, Event
 from pathlib import Path
 
 from . import db
@@ -151,6 +151,7 @@ class OTACache:
     CACHE_DIR = "/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
     DISK_USE_LIMIT_P = 80  # in p%
+    DISK_USE_PULL_INTERVAL = 2 # in seconds
     BUCKET_FILE_SIZE_LIST = (
         0,
         10_240,  # 10KiB
@@ -168,9 +169,19 @@ class OTACache:
         self._cache_enabled = cache_enabled
         self._gateway_proxy = upper_proxy is None
 
+        self._enough_free_space = Event()
+
         if cache_enabled:
             self._cache_enabled = True
             self._executor = ThreadPoolExecutor()
+            
+            cmd = f"findmnt -o SOURCE -n {self.CACHE_DIR}"
+            self._cache_dev = _subprocess_check_output(cmd, raise_exception=True)
+
+            # dispatch a background task to pulling the disk usage info
+            self._executor.submit(
+                self._background_check_free_space
+            )
 
             # prepare cache dire
             if init:
@@ -202,21 +213,23 @@ class OTACache:
     def __del__(self):
         self.close()
 
-    def _check_free_space(self) -> bool:
-        try:
-            cmd = f"findmnt -o SOURCE -n {self.CACHE_DIR}"
-            dev = _subprocess_check_output(cmd, raise_exception=True)
-            cmd = f"df --output=pcent {dev}"
-            current_used_p = _subprocess_check_output(cmd, raise_exception=True)
+    def _background_check_free_space(self) -> bool:
+        while not self._closed:
+            try:
+                cmd = f"df --output=pcent {self._cache_dev}"
+                current_used_p = _subprocess_check_output(cmd, raise_exception=True)
 
-            # expected output:
-            # 0: Use%
-            # 1: 33%
-            current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
-            return current_used_p < self.DISK_USE_LIMIT_P
-        except Exception:
-            return False
-
+                # expected output:
+                # 0: Use%
+                # 1: 33%
+                current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
+                if current_used_p < self.DISK_USE_LIMIT_P:
+                    self._enough_free_space.set()
+            except Exception:
+                self._enough_free_space.clear()
+            
+            time.sleep(self.DISK_USE_PULL_INTERVAL)
+        
     def _init_buckets(self):
         self._buckets = dict()  # dict[file_size_target]List[hash]
         self._bucket_locks = dict()  # dict[file_size]Lock
@@ -268,7 +281,7 @@ class OTACache:
         return target_size
 
     def _ensure_free_space(self, size: int) -> bool:
-        if not self._check_free_space():  # no enough free space
+        if not self._enough_free_space.is_set():  # no enough free space
             bucket_size = self._find_target_bucket_size(size)
             # first check the current bucket
             # if it is the last bucket, only check the current bucket

@@ -16,6 +16,12 @@ class App:
             upper_proxy=upper_proxy, cache_enable=cache_enabled, init=True
         )
 
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        self._ota_cache.close(cleanup=True)
+
     async def _respond_with_error(self, status: HTTPStatus, msg: str, send):
         await send(
             {
