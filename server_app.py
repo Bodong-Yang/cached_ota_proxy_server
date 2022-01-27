@@ -1,26 +1,39 @@
 from http import HTTPStatus
+from threading import Lock
 
 from . import ota_cache
 
 import logging
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  
 
 # only expose app
-__all__ = "get_app"
+__all__ = "App"
 
 
 class App:
     def __init__(self, cache_enabled=False, upper_proxy: str = None):
-        self._ota_cache = ota_cache.OTACache(
-            upper_proxy=upper_proxy, cache_enable=cache_enabled, init=True
-        )
+        self.cache_enabled=cache_enabled
+        self.upper_proxy=upper_proxy
+        self.started = False
 
-    def __del__(self):
-        self.close()
+        self._lock = Lock()
 
-    def close(self):
-        self._ota_cache.close(cleanup=True)
+    def start(self):
+        if self._lock.acquire(blocking=False):
+            if not self.started:
+                logger.info("start ota http proxy app...")
+                self.started = True
+                self._ota_cache = ota_cache.OTACache(
+                    upper_proxy=self.upper_proxy, cache_enabled=self.cache_enabled, init=True
+                )
+            self._lock.release()
+
+    def stop(self):
+        if self._lock.acquire(blocking=False):
+            if self.started:
+                logger.info("stopping ota http proxy app...")
+                self._ota_cache.close()
+            self._lock.release()
 
     async def _respond_with_error(self, status: HTTPStatus, msg: str, send):
         await send(
@@ -79,10 +92,11 @@ class App:
         # finish the streaming
         await self._send_chunk(b"", False, send)
 
-    async def __call__(self, scope, receive, send):
+    async def app(self, scope, send):
         """
-        the entrance of the app
+        the real entry for the server app
         """
+        from urllib.parse import urlparse
         assert scope["type"] == "http"
         # check method, currently only support GET method
         if scope["method"] != "GET":
@@ -92,4 +106,29 @@ class App:
 
         # get the url from the request
         url = scope["path"]
+        _url = urlparse(url)
+        if not _url.scheme or not _url.path:
+            msg = f"INVALID URL {url}."
+            await self._respond_with_error(HTTPStatus.BAD_REQUEST, msg, send)
+            return
+
         await self._pull_data_and_send(url, send)
+
+    async def __call__(self, scope, receive, send):
+        """
+        the entrance of the asgi app
+        """
+        if scope['type'] == 'lifespan':
+            # handling lifespan protocol
+            while True:
+                message = await receive()
+                if message['type'] == 'lifespan.startup':
+                    self.start()
+                    await send({'type': 'lifespan.startup.complete'})
+                elif message['type'] == 'lifespan.shutdown':
+                    self.stop()
+                    await send({'type': 'lifespan.shutdown.complete'})
+                    return
+        else:
+            # real app entry
+            self.app(self, scope, send)
