@@ -1,5 +1,4 @@
-import io
-from async_timeout import asyncio
+import asyncio
 import requests
 import subprocess
 import shlex
@@ -12,6 +11,10 @@ from threading import Lock
 from pathlib import Path
 
 from . import db
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
@@ -37,6 +40,7 @@ class OTAFile:
         session: requests.Session,
         meta: db.CacheMeta = None,
         store_cache: bool = False,
+        enable_https: bool = False,
     ):
 
         self.base_path = base_path
@@ -77,7 +81,11 @@ class OTAFile:
             self._queue = Queue()
 
             # open the remote connection
-            self._response = self._session.get(self.url, stream=True)
+            _url = url
+            if enable_https:
+                _url = url.replace("http", "https")
+
+            self._response = self._session.get(_url, stream=True)
             self.content_type = self._response.headers.get(
                 "Content-Type", "application/octet-stream"
             )
@@ -143,22 +151,22 @@ class OTACache:
     CACHE_DIR = "/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
     DISK_USE_LIMIT_P = 80  # in p%
-    # 0, 10KiB, 100KiB, 500KiB, 1MiB, 5MiB, 10MiB, 100MiB, 1GiB
     BUCKET_FILE_SIZE_LIST = (
         0,
-        10_240,
-        102_400,
-        512_000,
-        1_048_576,
-        5_242_880,
-        10_485_760,
-        104_857_600,
-        1_048_576_000,
+        10_240,  # 10KiB
+        102_400,  # 100KiB
+        512_000,  # 500KiB
+        1_048_576,  # 1MiB
+        5_242_880,  # 5MiB
+        10_485_760,  # 10MiB
+        104_857_600,  # 100MiB
+        1_048_576_000,  # 1GiB
     )  # Bytes
 
-    def __init__(self, cache_enabled: bool, init: bool):
+    def __init__(self, cache_enabled: bool, init: bool, upper_proxy: str = None):
         self._closed = False
         self._cache_enabled = cache_enabled
+        self._gateway_proxy = upper_proxy is None
 
         if cache_enabled:
             self._cache_enabled = True
@@ -174,6 +182,9 @@ class OTACache:
             # we cache the contents as its original form, and send
             # to the client
             self._session = requests.Session()
+            if upper_proxy:
+                proxies = {"http": upper_proxy, "https": ''}
+                self._session.proxies.update(proxies)
 
             self._init_buckets()
         else:
@@ -228,6 +239,7 @@ class OTACache:
             cache_meta = db.CacheMeta(
                 url=f.url,
                 hash=f.hash,
+                size=f.size,
                 content_type=f.content_type,
                 content_encoding=f.content_encoding,
             )
@@ -336,7 +348,11 @@ class OTACache:
         if not self._cache_enabled:
             # case 1: not using cache, directly download file
             res = OTAFile(
-                url=url, base_path=None, session=self._session, store_cache=False
+                url=url,
+                base_path=None,
+                session=self._session,
+                store_cache=False,
+                enable_https=self._gateway_proxy,
             )
         else:
             new_cache = False
@@ -361,6 +377,7 @@ class OTACache:
                     base_path=self.CACHE_DIR,
                     session=self._session,
                     store_cache=store_cache,
+                    enable_https=self._gateway_proxy,
                 )
 
                 if store_cache:
@@ -380,9 +397,8 @@ class OTACache:
                     url=url,
                     base_path=self.CACHE_DIR,
                     session=self._session,
-                    hash=cache_meta.hash,
-                    content_type=cache_meta.content_type,
-                    content_encoding=cache_meta.content_encoding,
+                    cache_meta=cache_meta,
+                    enable_https=self._gateway_proxy,
                 )
 
         return res

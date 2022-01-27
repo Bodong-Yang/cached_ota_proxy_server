@@ -2,18 +2,28 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import List, Tuple
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class CacheMeta:
     url: str
     hash: str
+    size: int
     content_type: str
     content_encoding: str
 
     def to_tuple(self) -> tuple:
-        return (self.url, self.hash, self.content_type, self.content_encoding)
+        return (
+            self.url,
+            self.hash,
+            self.size,
+            self.content_type,
+            self.content_encoding,
+        )
 
 
 class OTACacheDB:
@@ -21,8 +31,9 @@ class OTACacheDB:
     COLUMNS: dict = {
         "url": 0,
         "hash": 1,
-        "content_type": 2,
-        "content_encoding": 3,
+        "size": 2,
+        "content_type": 3,
+        "content_encoding": 4,
     }
 
     def __init__(self, db_file: str, init: bool = False):
@@ -43,6 +54,7 @@ class OTACacheDB:
             f"""CREATE TABLE {self.TABLE_NAME}(
                     url text UNIQUE PRIMARY KEY, 
                     hash text NOT NULL, 
+                    size real NOT NULL,
                     content_type text, 
                     content_encoding text)"""
         )
@@ -53,10 +65,10 @@ class OTACacheDB:
     def _connect_db(self, init: bool):
         if init:
             Path(self._db_file).unlink(missing_ok=True)
-            self._con = sqlite3.connect(self._db_file)
+            self._con = sqlite3.connect(self._db_file, check_same_thread=False)
             self._init_table()
         else:
-            self._con = sqlite3.connect(self._db_file)
+            self._con = sqlite3.connect(self._db_file, check_same_thread=False)
 
         # check if the table exists
         cur = self._con.cursor()
@@ -97,7 +109,7 @@ class OTACacheDB:
         rows = [m.to_tuple() for m in cache_meta]
         with self._wlock:
             cur = self._con.cursor()
-            cur.executemany(f"INSERT INTO {self.TABLE_NAME} VALUES (?,?,?,?)", rows)
+            cur.executemany(f"INSERT INTO {self.TABLE_NAME} VALUES (?,?,?,?,?)", rows)
 
             self._con.commit()
             cur.close()
@@ -115,6 +127,7 @@ class OTACacheDB:
         res = CacheMeta(
             url=row[self.COLUMNS["url"]],
             hash=row[self.COLUMNS["hash"]],
+            size=row[self.COLUMNS["size"]],
             content_type=row[self.COLUMNS["content_type"]],
             content_encoding=row[self.COLUMNS["content_encoding"]],
         )

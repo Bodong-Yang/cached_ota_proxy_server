@@ -1,19 +1,20 @@
-import asyncio
-import logging
-import io
 from http import HTTPStatus
 
 from . import ota_cache
 
+import logging
+
 logger = logging.getLogger(__name__)
 
 # only expose app
-__all__ = "app"
+__all__ = "get_app"
 
 
-class _App:
-    def __init__(self, cache_enabled=False):
-        self._ota_cache = ota_cache.OTACache(cache_enable=cache_enabled, init=True)
+class App:
+    def __init__(self, cache_enabled=False, upper_proxy: str = None):
+        self._ota_cache = ota_cache.OTACache(
+            upper_proxy=upper_proxy, cache_enable=cache_enabled, init=True
+        )
 
     async def _respond_with_error(self, status: HTTPStatus, msg: str, send):
         await send(
@@ -84,12 +85,5 @@ class _App:
             return
 
         # get the url from the request
-        try:
-            url, hash = scope["path"], scope["headers"]
-        except Exception:
-            self._respond_with_error("lack of critical headers")
-
+        url = scope["path"]
         await self._pull_data_and_send(url, send)
-
-
-app = _App()
