@@ -13,22 +13,31 @@ from pathlib import Path
 
 from . import db
 
+
 def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
     try:
-        return subprocess.check_output(shlex.split(cmd), stderr=subprocess.DEVNULL).decode().strip()
+        return (
+            subprocess.check_output(shlex.split(cmd), stderr=subprocess.DEVNULL)
+            .decode()
+            .strip()
+        )
     except subprocess.CalledProcessError:
         if raise_exception:
             raise
         return ""
 
+
 class OTAFile:
-    CHUNK_SIZE = 4194_304 # in bytes, 4MB
+    CHUNK_SIZE = 4194_304  # in bytes, 4MB
 
     def __init__(
-        self, url: str, base_path: str,
+        self,
+        url: str,
+        base_path: str,
         session: requests.Session,
-        meta: db.CacheMeta=None,
-        store_cache: bool=False):
+        meta: db.CacheMeta = None,
+        store_cache: bool = False,
+    ):
 
         self.base_path = base_path
         self._session = session
@@ -44,15 +53,15 @@ class OTAFile:
 
         # data fp that we used in iterator
         self._fp = None
-        self._dst_fp = None # cache entry dst if store_cache
+        self._dst_fp = None  # cache entry dst if store_cache
 
         # life cycle
         self._finished = False
         self.cached_success = False
 
-        if meta: # cache entry presented
+        if meta:  # cache entry presented
             self.hash: str = meta.hash
-            self.fpath = Path(self.base_path)/self.hash
+            self.fpath = Path(self.base_path) / self.hash
 
             if self.fpath.is_file():
                 # check if it is a dangling cache
@@ -61,38 +70,43 @@ class OTAFile:
                 self.content_encoding = meta.content_encoding
                 self.size = meta.size
                 self._cached = True
-                self._fp = open(self.fpath, 'rb')
-        
+                self._fp = open(self.fpath, "rb")
+
         if not self._cached:
             # open a queue
             self._queue = Queue()
 
             # open the remote connection
             self._response = self._session.get(self.url, stream=True)
-            self.content_type = self._response.headers.get("Content-Type", 'application/octet-stream')
-            self.content_encoding = self._response.headers.get("Content-Encoding", '')
+            self.content_type = self._response.headers.get(
+                "Content-Type", "application/octet-stream"
+            )
+            self.content_encoding = self._response.headers.get("Content-Encoding", "")
             self._fp = self._response.raw
-    
+
     def background_write_cache(self, callback):
         if not self._store_cache:
             return
-        
+
         try:
             self._hash_f = sha256()
-            tmp_fpath = Path(self.base_path)/str(time.time()).replace('.','')
+            tmp_fpath = Path(self.base_path) / str(time.time()).replace(".", "")
             self.temp_fpath = tmp_fpath
-            self._dst_fp = open(tmp_fpath, 'wb')
+            self._dst_fp = open(tmp_fpath, "wb")
 
             while not self._finished or not self._queue.empty():
-                data = self._queue.get()
+                data = self._queue.get(timeout=3)
                 self._hash_f.update(data)
                 self.size += self._dst_fp.write(data)
-            
+
             self._dst_fp.close()
-            # rename the file to the hash value
-            self.temp_fpath.rename(Path(self.base_path)/self.hash)
-            self.hash = self._hash_f.hexdigest()
-            self.cached_success = True
+            if self._finished and self.size > 0:  # not caching 0 size file
+                # rename the file to the hash value
+                self.temp_fpath.rename(Path(self.base_path) / self.hash)
+                self.hash = self._hash_f.hexdigest()
+                self.cached_success = True
+            # NOTE: if queue is empty but self._finished is not set
+            # an unfinished caching might happen
         finally:
             # execute the callback function
             callback(self)
@@ -105,11 +119,11 @@ class OTAFile:
             raise ValueError("file is closed")
 
         chunk = self._fp.read(self.CHUNK_SIZE)
-        if len(chunk) == 0: # stream finished
+        if len(chunk) == 0:  # stream finished
             self._finished = True
             # finish the background cache writing
             if self._store_cache:
-                self._queue.put(b'')
+                self._queue.put(b"")
 
             # cleanup
             self._fp.close()
@@ -124,15 +138,26 @@ class OTAFile:
 
             return chunk
 
+
 class OTACache:
     CACHE_DIR = "/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
-    DISK_USE_LIMIT_P = 80 # in p%
+    DISK_USE_LIMIT_P = 80  # in p%
     # 0, 10KiB, 100KiB, 500KiB, 1MiB, 5MiB, 10MiB, 100MiB, 1GiB
     BUCKET_FILE_SIZE_LIST = (
-        0, 10_240, 102_400, 512_000, 1_048_576, 5_242_880, 10_485_760, 104_857_600, 1_048_576_000) # Bytes
+        0,
+        10_240,
+        102_400,
+        512_000,
+        1_048_576,
+        5_242_880,
+        10_485_760,
+        104_857_600,
+        1_048_576_000,
+    )  # Bytes
 
     def __init__(self, cache_enabled: bool, init: bool):
+        self._closed = False
         self._cache_enabled = cache_enabled
 
         if cache_enabled:
@@ -154,80 +179,84 @@ class OTACache:
         else:
             self._cache_enabled = False
 
-    def __del__(self):
-        if self._cache_enabled:
+    def close(self, cleanup: bool = False):
+        if self._cache_enabled and not self._closed:
+            self._closed = True
             self._executor.shutdown(wait=True)
+            self._db.close()
+
+            if cleanup:
+                shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
+
+    def __del__(self):
+        self.close()
 
     def _check_free_space(self) -> bool:
         try:
-            cmd = f'findmnt -o SOURCE -n {self.CACHE_DIR}'
+            cmd = f"findmnt -o SOURCE -n {self.CACHE_DIR}"
             dev = _subprocess_check_output(cmd, raise_exception=True)
-            cmd = f'df --output=pcent {dev}'
+            cmd = f"df --output=pcent {dev}"
             current_used_p = _subprocess_check_output(cmd, raise_exception=True)
 
             # expected output:
             # 0: Use%
             # 1: 33%
-            current_used_p = int(current_used_p.splitlines()[-1].strip(' %'))
+            current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
             return current_used_p < self.DISK_USE_LIMIT_P
         except Exception:
             return False
 
     def _init_buckets(self):
-        """
-        only one buckets currently
-        """
-        self._buckets = dict() # dict[file_size_target]list[hash]
-        self._bucket_locks = dict() # dict[file_size]Lock
+        self._buckets = dict()  # dict[file_size_target]List[hash]
+        self._bucket_locks = dict()  # dict[file_size]Lock
 
-        # file size larger than 0KiB
         for s in self.BUCKET_FILE_SIZE_LIST:
             self._buckets[s] = list()
             self._bucket_locks[s] = Lock()
 
     def _register_cache_callback(self, f: OTAFile):
         """
-        the callback of register new cached file
-        the caller will call this method if the new cached file is valid
-
-        NOTE: the caller should not forget calling this method or 
-        retrieve_file_cleanup_file_callback method,
-        otherwise there will be dangling cached files
+        the callback for finishing up caching
         """
-        bucket = self._find_target_bucket_size(f.size)
-
         if f.cached_success:
-            with self._bucket_locks[bucket]:
+            bucket = self._find_target_bucket_size(f.size)
+            with self._bucket_locks[bucket]:  # only lock specific bucket
                 # regist the file, append to the bucket
                 self._buckets[bucket].append(f.hash)
-                # row: (url, hash, content_type, content_encoding)
-                row = (f.url, f.hash, f.content_type, f.content_encoding)
-                self._db.insert_urls(row)
+
+            # register to the database
+            cache_meta = db.CacheMeta(
+                url=f.url,
+                hash=f.hash,
+                content_type=f.content_type,
+                content_encoding=f.content_encoding,
+            )
+            self._db.insert_urls(cache_meta)
         else:
             # try to cleanup the dangling cache file
             Path(f.temp_fpath).unlink(missing_ok=True)
 
     def _find_target_bucket_size(self, file_size: int) -> int:
-        s, e = 0, len(self.BUCKET_FILE_SIZE_LIST)-1
+        s, e = 0, len(self.BUCKET_FILE_SIZE_LIST) - 1
         target_size = None
 
         if file_size >= self.BUCKET_FILE_SIZE_LIST[-1]:
             target_size = self.BUCKET_FILE_SIZE_LIST[-1]
         else:
             while True:
-                if abs(e-s) <= 1:
+                if abs(e - s) <= 1:
                     target_size = s
                     break
 
-                if file_size <= self.BUCKET_FILE_SIZE_LIST[(s+e)//2]:
-                    e = (s+e)//2
-                elif file_size > self.BUCKET_FILE_SIZE_LIST[(s+e)//2]:
-                    s = (s+e)//2
+                if file_size <= self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
+                    e = (s + e) // 2
+                elif file_size > self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
+                    s = (s + e) // 2
 
         return target_size
 
     def _ensure_free_space(self, size: int) -> bool:
-        if not self._check_free_space(): # no enough free space
+        if not self._check_free_space():  # no enough free space
             bucket_size = self._find_target_bucket_size(size)
             # first check the current bucket
             # if it is the last bucket, only check the current bucket
@@ -238,7 +267,7 @@ class OTACache:
                     index = i
                     break
                 else:
-                    f: Path = Path(self.CACHE_DIR)/hash
+                    f: Path = Path(self.CACHE_DIR) / hash
                     if f.is_file():
                         # NOTE: deal with dangling cache?
                         files_size += f.stat().st_size
@@ -251,7 +280,7 @@ class OTACache:
                     hash = bucket[0]
                     bucket = bucket[1:]
 
-                    f: Path = Path(self.CACHE_DIR)/hash
+                    f: Path = Path(self.CACHE_DIR) / hash
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(hash)
 
@@ -261,28 +290,30 @@ class OTACache:
             else:
                 # if current bucket is not enough, check higher bucket
                 next_bucket, next_bucket_size = None, 0
-                for bs in self.BUCKET_FILE_SIZE_LIST[self.BUCKET_FILE_SIZE_LIST.index(bucket_size)+1:]:
+                for bs in self.BUCKET_FILE_SIZE_LIST[
+                    self.BUCKET_FILE_SIZE_LIST.index(bucket_size) + 1 :
+                ]:
                     if len(self._buckets[bs]) > 0:
                         next_bucket = self._buckets[bs]
                         next_bucket_size = bs
                         break
-                
+
                 if next_bucket:
                     # get one entry from the target bucket
                     # and then delete it
                     hash = next_bucket[0]
                     self._buckets[next_bucket_size] = next_bucket[1:]
 
-                    f: Path = Path(self.CACHE_DIR)/hash
+                    f: Path = Path(self.CACHE_DIR) / hash
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(hash)
 
                     return True
-        else: # there is already enough space
+        else:  # there is already enough space
             return True
 
         return False
-    
+
     def _promote_cache_entry(self, size: int, hash: str):
         bsize = self._find_target_bucket_size(size)
         bucket = self._buckets[bsize]
@@ -290,49 +321,55 @@ class OTACache:
         try:
             # warm up the cache entry
             entry_index = bucket.index(hash)
-            bucket = bucket[:entry_index] + bucket[entry_index+1:]
+            bucket = bucket[:entry_index] + bucket[entry_index + 1 :]
             bucket.append(hash)
         except Exception:
             # NOTE: not dealing with dangling cache entry now
             pass
-    
-    # exposed API
 
+    # exposed API
     async def retrieve_file(self, url: str, size: int) -> OTAFile:
+        if self._closed:
+            raise ValueError("ota cache pool is closed")
+
         res = None
         if not self._cache_enabled:
             # case 1: not using cache, directly download file
             res = OTAFile(
-                url=url, base_path=None, session=self._session, store_cache=False)
+                url=url, base_path=None, session=self._session, store_cache=False
+            )
         else:
             new_cache = False
 
             cache_meta = self._db.lookup_url(url)
-            if cache_meta: # cache hit
+            if cache_meta:  # cache hit
                 hash = cache_meta.hash
-                path = Path(self.CACHE_DIR)/hash
+                path = Path(self.CACHE_DIR) / hash
                 if not path.is_file():
                     # invalid cache entry found in the db, cleanup it
                     self._db.remove_urls(url)
                     new_cache = True
-            
-            # check whether we should use cache, not use cache, 
+
+            # check whether we should use cache, not use cache,
             # or download and cache the new file
             if new_cache:
                 # case 2: download and cache new file
                 # try to ensure space for new cache
                 store_cache = self._ensure_free_space(size)
                 res = OTAFile(
-                    url=url, base_path=self.CACHE_DIR, session=self._session,
-                    store_cache=store_cache)
+                    url=url,
+                    base_path=self.CACHE_DIR,
+                    session=self._session,
+                    store_cache=store_cache,
+                )
 
                 if store_cache:
                     # dispatch the background cache writing to executor
                     loop = asyncio.get_running_loop()
                     loop.run_in_executor(
-                        self._executor, 
+                        self._executor,
                         res.background_write_cache,
-                        self._register_cache_callback
+                        self._register_cache_callback,
                     )
             else:
                 # case 3: use cache
@@ -340,9 +377,12 @@ class OTACache:
                 self._promote_cache_entry(cache_meta.size, cache_meta.hash)
                 # use cache
                 res = OTAFile(
-                    url=url, base_path=self.CACHE_DIR, session=self._session,
+                    url=url,
+                    base_path=self.CACHE_DIR,
+                    session=self._session,
                     hash=cache_meta.hash,
                     content_type=cache_meta.content_type,
-                    content_encoding=cache_meta.content_encoding)
+                    content_encoding=cache_meta.content_encoding,
+                )
 
         return res
