@@ -4,16 +4,20 @@ from threading import Lock
 from . import ota_cache
 
 import logging
-logger = logging.getLogger(__name__)  
+
+logger = logging.getLogger(__name__)
 
 # only expose app
 __all__ = "App"
 
 
 class App:
-    def __init__(self, cache_enabled=False, upper_proxy: str = None):
-        self.cache_enabled=cache_enabled
-        self.upper_proxy=upper_proxy
+    def __init__(
+        self, cache_enabled=False, upper_proxy: str = None, enable_https: bool = False
+    ):
+        self.cache_enabled = cache_enabled
+        self.upper_proxy = upper_proxy
+        self.enable_https = enable_https
         self.started = False
 
         self._lock = Lock()
@@ -24,7 +28,10 @@ class App:
                 logger.info("start ota http proxy app...")
                 self.started = True
                 self._ota_cache = ota_cache.OTACache(
-                    upper_proxy=self.upper_proxy, cache_enabled=self.cache_enabled, init=True
+                    upper_proxy=self.upper_proxy,
+                    cache_enabled=self.cache_enabled,
+                    init=True,
+                    enable_https=self.enable_https,
                 )
             self._lock.release()
 
@@ -33,6 +40,7 @@ class App:
             if self.started:
                 logger.info("stopping ota http proxy app...")
                 self._ota_cache.close()
+                logger.info("shutdown server completed")
             self._lock.release()
 
     async def _respond_with_error(self, status: HTTPStatus, msg: str, send):
@@ -48,7 +56,10 @@ class App:
         await send({"type": "http.response.body", "body": msg.encode("utf8")})
 
     async def _send_chunk(self, data: bytes, more: bool, send):
-        await send({"type": "http.response.body", "body": data, "more_body": more})
+        if more:
+            await send({"type": "http.response.body", "body": data, "more_body": True})
+        else:
+            await send({"type": "http.response.body", "body": b""})
 
     async def _init_response(self, status: HTTPStatus, headers: dict, send):
         await send(
@@ -88,8 +99,7 @@ class App:
         # stream the response to the client
         async for chunk in f:
             await self._send_chunk(chunk, True, send)
-
-        # finish the streaming
+        # finish the streaming by send a 0 len payload
         await self._send_chunk(b"", False, send)
 
     async def app(self, scope, send):
@@ -97,6 +107,7 @@ class App:
         the real entry for the server app
         """
         from urllib.parse import urlparse
+
         assert scope["type"] == "http"
         # check method, currently only support GET method
         if scope["method"] != "GET":
@@ -112,23 +123,24 @@ class App:
             await self._respond_with_error(HTTPStatus.BAD_REQUEST, msg, send)
             return
 
+        logger.debug(f"receive request for {url=}")
         await self._pull_data_and_send(url, send)
 
     async def __call__(self, scope, receive, send):
         """
         the entrance of the asgi app
         """
-        if scope['type'] == 'lifespan':
+        if scope["type"] == "lifespan":
             # handling lifespan protocol
             while True:
                 message = await receive()
-                if message['type'] == 'lifespan.startup':
+                if message["type"] == "lifespan.startup":
                     self.start()
-                    await send({'type': 'lifespan.startup.complete'})
-                elif message['type'] == 'lifespan.shutdown':
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
                     self.stop()
-                    await send({'type': 'lifespan.shutdown.complete'})
+                    await send({"type": "lifespan.shutdown.complete"})
                     return
         else:
             # real app entry
-            self.app(self, scope, send)
+            await self.app(scope, send)

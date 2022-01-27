@@ -77,7 +77,7 @@ class OTACacheDB:
         # check if the table exists
         cur = self._con.cursor()
         cur.execute(
-            f"SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
             (self.TABLE_NAME,),
         )
         if cur.fetchone() is None:

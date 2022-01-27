@@ -14,7 +14,7 @@ from . import db
 
 import logging
 
-logger = logging.getLogger(__name__)  
+logger = logging.getLogger(__name__)
 
 
 def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
@@ -41,7 +41,7 @@ class OTAFile:
         meta: db.CacheMeta = None,
         store_cache: bool = False,
         enable_https: bool = False,
-        free_space_event: Event = None
+        free_space_event: Event = None,
     ):
         self.base_path = base_path
         self._session = session
@@ -59,6 +59,7 @@ class OTAFile:
         # data fp that we used in iterator
         self._fp = None
         self._dst_fp = None  # cache entry dst if store_cache
+        self._response = None
 
         # life cycle
         self._finished = False
@@ -94,7 +95,7 @@ class OTAFile:
             self._fp = self._response.raw
 
     def background_write_cache(self, callback):
-        if not self._store_cache:
+        if not self._store_cache or not self._free_space_event:
             return
 
         try:
@@ -107,6 +108,9 @@ class OTAFile:
                 if not self._free_space_event.is_set():
                     # if the free space is not enough duing caching
                     # abort the caching
+                    logger.error(
+                        f"not enough free space during caching url={self.url}, abort"
+                    )
                     break
 
                 data = self._queue.get(timeout=3)
@@ -116,9 +120,10 @@ class OTAFile:
             self._dst_fp.close()
             if self._finished and self.size > 0:  # not caching 0 size file
                 # rename the file to the hash value
-                self.temp_fpath.rename(Path(self.base_path) / self.hash)
                 self.hash = self._hash_f.hexdigest()
+                self.temp_fpath.rename(Path(self.base_path) / self.hash)
                 self.cached_success = True
+                logger.debug(f"successfully cache url={self.url}")
             # NOTE: if queue is empty but self._finished is not set
             # an unfinished caching might happen
         finally:
@@ -157,7 +162,7 @@ class OTACache:
     CACHE_DIR = "/run/test/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
     DISK_USE_LIMIT_P = 80  # in p%
-    DISK_USE_PULL_INTERVAL = 2 # in seconds
+    DISK_USE_PULL_INTERVAL = 2  # in seconds
     BUCKET_FILE_SIZE_LIST = (
         0,
         10_240,  # 10KiB
@@ -170,28 +175,32 @@ class OTACache:
         1_048_576_000,  # 1GiB
     )  # Bytes
 
-    def __init__(self, cache_enabled: bool, init: bool, upper_proxy: str = None):
-        logger.debug("init ota cache...")
-        
+    def __init__(
+        self,
+        cache_enabled: bool,
+        init: bool,
+        upper_proxy: str = None,
+        enable_https: bool = False,
+    ):
+        logger.debug(f"init ota cache({cache_enabled=}, {init=}, {upper_proxy=})")
+
         self._closed = False
         self._cache_enabled = cache_enabled
-        self._gateway_proxy = upper_proxy is None
+        self._enable_https = enable_https
         self._executor = ThreadPoolExecutor()
 
-        self._enough_free_space = Event()
+        self._enough_free_space_event = Event()
 
         if cache_enabled:
             self._cache_enabled = True
-            
+
             # prepare cache dire
             if init:
                 shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
             Path(self.CACHE_DIR).mkdir(exist_ok=True)
 
             # dispatch a background task to pulling the disk usage info
-            self._executor.submit(
-                self._background_check_free_space
-            )
+            self._executor.submit(self._background_check_free_space)
 
             self._db = db.OTACacheDB(self.DB_FILE)
             # NOTE: requests doesn't decompress the contents,
@@ -199,7 +208,7 @@ class OTACache:
             # to the client
             self._session = requests.Session()
             if upper_proxy:
-                proxies = {"http": upper_proxy, "https": ''}
+                proxies = {"http": upper_proxy, "https": ""}
                 self._session.proxies.update(proxies)
 
             self._init_buckets()
@@ -207,18 +216,15 @@ class OTACache:
             self._cache_enabled = False
 
     def close(self, cleanup: bool = False):
-        logger.debug("cleanup ota-cache...")
+        logger.debug(f"shutdown ota-cache({cleanup=})...")
         if self._cache_enabled and not self._closed:
             self._closed = True
-            self._executor.shutdown()
+            self._executor.shutdown(wait=True)
             self._db.close()
 
             if cleanup:
                 shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
-
-    def _ensure_server_running(self):
-        while True:
-            time.sleep(1)
+        logger.info("shutdown ota-cache completed")
 
     def _background_check_free_space(self) -> bool:
         while not self._closed:
@@ -231,14 +237,14 @@ class OTACache:
                 # 1: 33%
                 current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
                 if current_used_p < self.DISK_USE_LIMIT_P:
-                    self._enough_free_space.set()
+                    self._enough_free_space_event.set()
                 else:
-                    self._enough_free_space.clear()
+                    self._enough_free_space_event.clear()
             except Exception:
-                self._enough_free_space.clear()
-            
+                self._enough_free_space_event.clear()
+
             time.sleep(self.DISK_USE_PULL_INTERVAL)
-        
+
     def _init_buckets(self):
         self._buckets = dict()  # dict[file_size_target]List[hash]
         self._bucket_locks = dict()  # dict[file_size]Lock
@@ -251,14 +257,15 @@ class OTACache:
         """
         the callback for finishing up caching
 
-        NOTE: 
+        NOTE:
         1. if the free space is used up duing caching,
         the caching will terminate immediately.
         2. if the free space is used up after cache writing finished,
-        we will first try reserving free space, if fails, 
+        we will first try reserving free space, if fails,
         then we delete the already cached file.
         """
         if f.cached_success and self._ensure_free_space(f.size):
+            logger.debug(f"committing cache for {f.url}...")
             bucket = self._find_target_bucket_size(f.size)
             with self._bucket_locks[bucket]:  # only lock specific bucket
                 # regist the file, append to the bucket
@@ -278,26 +285,31 @@ class OTACache:
             Path(f.temp_fpath).unlink(missing_ok=True)
 
     def _find_target_bucket_size(self, file_size: int) -> int:
+        if file_size < 0:
+            raise ValueError(f"invalid file size {file_size}")
+
         s, e = 0, len(self.BUCKET_FILE_SIZE_LIST) - 1
         target_size = None
 
         if file_size >= self.BUCKET_FILE_SIZE_LIST[-1]:
             target_size = self.BUCKET_FILE_SIZE_LIST[-1]
         else:
+            idx = None
             while True:
                 if abs(e - s) <= 1:
-                    target_size = s
+                    idx = s
                     break
 
                 if file_size <= self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
                     e = (s + e) // 2
                 elif file_size > self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
                     s = (s + e) // 2
+            target_size = self.BUCKET_FILE_SIZE_LIST[idx]
 
         return target_size
 
     def _ensure_free_space(self, size: int) -> bool:
-        if not self._enough_free_space.is_set():  # no enough free space
+        if not self._enough_free_space_event.is_set():  # no enough free space
             bucket_size = self._find_target_bucket_size(size)
             # first check the current bucket
             # if it is the last bucket, only check the current bucket
@@ -355,7 +367,9 @@ class OTACache:
 
         return False
 
-    def _promote_cache_entry(self, size: int, hash: str):
+    def _promote_cache_entry(self, cache_meta: db.CacheMeta):
+        size, hash = cache_meta.size, cache_meta.hash
+
         bsize = self._find_target_bucket_size(size)
         bucket = self._buckets[bsize]
 
@@ -370,6 +384,7 @@ class OTACache:
 
     # exposed API
     async def retrieve_file(self, url: str) -> OTAFile:
+        logger.debug(f"try to retrieve file from {url=}")
         if self._closed:
             raise ValueError("ota cache pool is closed")
 
@@ -381,31 +396,39 @@ class OTACache:
                 base_path=None,
                 session=self._session,
                 store_cache=False,
-                enable_https=self._gateway_proxy,
+                enable_https=self._enable_https,
             )
         else:
-            new_cache = False
+            no_cache_available = True
 
             cache_meta = self._db.lookup_url(url)
             if cache_meta:  # cache hit
+                logger.debug(f"cache hit for {url=}\n, {cache_meta=}")
                 hash = cache_meta.hash
                 path = Path(self.CACHE_DIR) / hash
                 if not path.is_file():
                     # invalid cache entry found in the db, cleanup it
+                    logger.error(f"dangling cache entry found: \n{cache_meta=}")
                     self._db.remove_urls(url)
-                    new_cache = True
+                    no_cache_available = True
+                else:
+                    no_cache_available = False
+            else:
+                no_cache_available = True
 
             # check whether we should use cache, not use cache,
             # or download and cache the new file
-            if new_cache:
+            if no_cache_available:
                 # case 2: download and cache new file
                 # try to ensure space for new cache
+                logger.debug(f"try to download and cache {url=}")
                 res = OTAFile(
                     url=url,
                     base_path=self.CACHE_DIR,
                     session=self._session,
                     store_cache=True,
-                    enable_https=self._gateway_proxy,
+                    enable_https=self._enable_https,
+                    free_space_event=self._enough_free_space_event,
                 )
 
                 # dispatch the background cache writing to executor
@@ -418,14 +441,16 @@ class OTACache:
             else:
                 # case 3: use cache
                 # warm up the cache
-                self._promote_cache_entry(cache_meta.size, cache_meta.hash)
+                logger.debug(f"use cache for {url=}")
+                self._promote_cache_entry(cache_meta)
                 # use cache
                 res = OTAFile(
                     url=url,
                     base_path=self.CACHE_DIR,
                     session=self._session,
-                    cache_meta=cache_meta,
-                    enable_https=self._gateway_proxy,
+                    meta=cache_meta,
+                    enable_https=self._enable_https,
+                    free_space_event=self._enough_free_space_event,
                 )
 
         return res
