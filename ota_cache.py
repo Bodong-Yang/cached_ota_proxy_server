@@ -31,7 +31,7 @@ def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
 
 
 class OTAFile:
-    CHUNK_SIZE = 4194_304  # in bytes, 4MB
+    CHUNK_SIZE = 2097_152  # in bytes, 2MB
 
     def __init__(
         self,
@@ -99,6 +99,7 @@ class OTAFile:
             return
 
         try:
+            logger.debug(f"start to cache for {self.url=}")
             self._hash_f = sha256()
             tmp_fpath = Path(self.base_path) / str(time.time()).replace(".", "")
             self.temp_fpath = tmp_fpath
@@ -113,14 +114,18 @@ class OTAFile:
                     )
                     break
 
-                data = self._queue.get(timeout=3)
+                try:
+                    data = self._queue.get(timeout=360)
+                except Exception:
+                    logger.error(f"timeout caching for {self.url=}")
+                    break
                 self._hash_f.update(data)
                 self.size += self._dst_fp.write(data)
 
             self._dst_fp.close()
             if self._finished and self.size > 0:  # not caching 0 size file
                 # rename the file to the hash value
-                self.hash = self._hash_f.hexdigest()
+                self.hash = self._hash_f.hexdigest()[:16]
                 self.temp_fpath.rename(Path(self.base_path) / self.hash)
                 self.cached_success = True
                 logger.debug(f"successfully cache url={self.url}")
