@@ -167,7 +167,7 @@ class OTAFile:
 class OTACache:
     CACHE_DIR = "/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
-    DISK_USE_LIMIT_P = 70 # in p%
+    DISK_USE_LIMIT_P = 70  # in p%
     DISK_USE_PULL_INTERVAL = 2  # in seconds
     BUCKET_FILE_SIZE_LIST = (
         0,
@@ -342,17 +342,19 @@ class OTACache:
                     # if current bucket is enough for space reservation
                     # remove cache entries from the current bucket to reserve space
                     clear_files = bucket[:index]
-                    self._buckets[bucket_size] = bucket[index+1:]
+                    self._buckets[bucket_size] = bucket[index + 1 :]
 
-            if clear_files: # cleanup files in current bucket is enough for reserving space
+            if (
+                clear_files
+            ):  # cleanup files in current bucket is enough for reserving space
                 for hash in clear_files:
                     f: Path = Path(self.CACHE_DIR) / hash
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(hash)
-                    
+
                 return True
 
-            else: # if current bucket is not enough, check higher bucket
+            else:  # if current bucket is not enough, check higher bucket
                 entry_to_clear = None
                 for bs in self.BUCKET_FILE_SIZE_LIST[
                     self.BUCKET_FILE_SIZE_LIST.index(bucket_size) + 1 :

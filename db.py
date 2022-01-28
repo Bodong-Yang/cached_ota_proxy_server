@@ -51,6 +51,7 @@ class OTACacheDB:
             self._closed = True
 
     def _init_table(self):
+        logger.debug("init sqlite database...")
         cur = self._con.cursor()
 
         # create the table
