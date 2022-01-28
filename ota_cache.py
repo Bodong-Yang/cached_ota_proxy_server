@@ -43,6 +43,7 @@ class OTAFile:
         enable_https: bool = False,
         free_space_event: Event = None,
     ):
+        logger.debug(f"new OTAFile request: {url}")
         self.base_path = base_path
         self._session = session
         self._cached = False
@@ -99,7 +100,7 @@ class OTAFile:
             return
 
         try:
-            logger.debug(f"start to cache for {self.url=}")
+            logger.debug(f"start to cache for {self.url}...")
             self._hash_f = sha256()
             tmp_fpath = Path(self.base_path) / str(time.time()).replace(".", "")
             self.temp_fpath = tmp_fpath
@@ -117,7 +118,7 @@ class OTAFile:
                 try:
                     data = self._queue.get(timeout=360)
                 except Exception:
-                    logger.error(f"timeout caching for {self.url=}")
+                    logger.error(f"timeout caching for {self.url}, abort")
                     break
                 self._hash_f.update(data)
                 self.size += self._dst_fp.write(data)
@@ -128,7 +129,7 @@ class OTAFile:
                 self.hash = self._hash_f.hexdigest()[:16]
                 self.temp_fpath.rename(Path(self.base_path) / self.hash)
                 self.cached_success = True
-                logger.debug(f"successfully cache url={self.url}")
+                logger.debug(f"successfully cache {self.url}")
             # NOTE: if queue is empty but self._finished is not set
             # an unfinished caching might happen
         finally:
@@ -164,9 +165,9 @@ class OTAFile:
 
 
 class OTACache:
-    CACHE_DIR = "/run/test/ota-cache"
+    CACHE_DIR = "/ota-cache"
     DB_FILE = f"{CACHE_DIR}/cache_db"
-    DISK_USE_LIMIT_P = 80  # in p%
+    DISK_USE_LIMIT_P = 70 # in p%
     DISK_USE_PULL_INTERVAL = 2  # in seconds
     BUCKET_FILE_SIZE_LIST = (
         0,
@@ -202,7 +203,7 @@ class OTACache:
             # prepare cache dire
             if init:
                 shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
-            Path(self.CACHE_DIR).mkdir(exist_ok=True)
+            Path(self.CACHE_DIR).mkdir(exist_ok=True, parents=True)
 
             # dispatch a background task to pulling the disk usage info
             self._executor.submit(self._background_check_free_space)
@@ -213,8 +214,11 @@ class OTACache:
             # to the client
             self._session = requests.Session()
             if upper_proxy:
+                # override the proxy setting if we configure one
                 proxies = {"http": upper_proxy, "https": ""}
                 self._session.proxies.update(proxies)
+                # if upper proxy presented, we must disable https
+                self._enable_https = False
 
             self._init_buckets()
         else:
@@ -270,7 +274,7 @@ class OTACache:
         then we delete the already cached file.
         """
         if f.cached_success and self._ensure_free_space(f.size):
-            logger.debug(f"committing cache for {f.url}...")
+            logger.debug(f"commit cache for {f.url}...")
             bucket = self._find_target_bucket_size(f.size)
             with self._bucket_locks[bucket]:  # only lock specific bucket
                 # regist the file, append to the bucket
@@ -313,76 +317,84 @@ class OTACache:
 
         return target_size
 
+    # NOTE: possible refactor?
     def _ensure_free_space(self, size: int) -> bool:
         if not self._enough_free_space_event.is_set():  # no enough free space
             bucket_size = self._find_target_bucket_size(size)
+
             # first check the current bucket
-            # if it is the last bucket, only check the current bucket
-            bucket = self._buckets[bucket_size]
-            files_size, index = 0, 0
-            for i, hash in enumerate(bucket):
+            clear_files = []
+            with self._bucket_locks[bucket_size]:
+                bucket = self._buckets[bucket_size]
+
+                files_size, index = 0, 0
+                for i, hash in enumerate(bucket):
+                    if files_size >= size:
+                        index = i
+                        break
+                    else:
+                        f: Path = Path(self.CACHE_DIR) / hash
+                        if f.is_file():
+                            # TODO: deal with dangling cache?
+                            files_size += f.stat().st_size
+
                 if files_size >= size:
-                    index = i
-                    break
-                else:
-                    f: Path = Path(self.CACHE_DIR) / hash
-                    if f.is_file():
-                        # NOTE: deal with dangling cache?
-                        files_size += f.stat().st_size
+                    # if current bucket is enough for space reservation
+                    # remove cache entries from the current bucket to reserve space
+                    clear_files = bucket[:index]
+                    self._buckets[bucket_size] = bucket[index+1:]
 
-            if files_size >= size:
-                # if current bucket is enough for space reservation
-                # remove cache entries from the current bucket to reserve space
-                for _ in range(index):
-                    # get one entry from the bucket
-                    hash = bucket[0]
-                    bucket = bucket[1:]
-
+            if clear_files: # cleanup files in current bucket is enough for reserving space
+                for hash in clear_files:
                     f: Path = Path(self.CACHE_DIR) / hash
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(hash)
-
-                # sync the new bucket
-                self._buckets[bucket_size] = bucket
+                    
                 return True
-            else:
-                # if current bucket is not enough, check higher bucket
-                next_bucket, next_bucket_size = None, 0
+
+            else: # if current bucket is not enough, check higher bucket
+                entry_to_clear = None
                 for bs in self.BUCKET_FILE_SIZE_LIST[
                     self.BUCKET_FILE_SIZE_LIST.index(bucket_size) + 1 :
                 ]:
-                    if len(self._buckets[bs]) > 0:
-                        next_bucket = self._buckets[bs]
-                        next_bucket_size = bs
-                        break
+                    with self._bucket_locks[bs]:
+                        if len(self._buckets[bs]) > 0:
+                            # if we find a not-empty next bucket
+                            # get one entry out of it right away
 
-                if next_bucket:
+                            next_bucket = self._buckets[bs]
+                            entry_to_clear = next_bucket[0]
+                            self._buckets[bs] = next_bucket[1:]
+                            break
+
+                if entry_to_clear:
                     # get one entry from the target bucket
                     # and then delete it
-                    hash = next_bucket[0]
-                    self._buckets[next_bucket_size] = next_bucket[1:]
 
-                    f: Path = Path(self.CACHE_DIR) / hash
+                    f: Path = Path(self.CACHE_DIR) / entry_to_clear
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(hash)
 
                     return True
+
         else:  # there is already enough space
             return True
 
         return False
 
     def _promote_cache_entry(self, cache_meta: db.CacheMeta):
+        logger.debug(f"warm up cache {cache_meta.hash},{cache_meta.url}")
         size, hash = cache_meta.size, cache_meta.hash
 
         bsize = self._find_target_bucket_size(size)
-        bucket = self._buckets[bsize]
-
         try:
             # warm up the cache entry
-            entry_index = bucket.index(hash)
-            bucket = bucket[:entry_index] + bucket[entry_index + 1 :]
-            bucket.append(hash)
+            with self._bucket_locks[bsize]:
+                bucket = self._buckets[bsize]
+
+                entry_index = bucket.index(hash)
+                bucket = bucket[:entry_index] + bucket[entry_index + 1 :]
+                bucket.append(hash)
         except Exception:
             # NOTE: not dealing with dangling cache entry now
             pass
@@ -409,8 +421,7 @@ class OTACache:
             cache_meta = self._db.lookup_url(url)
             if cache_meta:  # cache hit
                 logger.debug(f"cache hit for {url=}\n, {cache_meta=}")
-                hash = cache_meta.hash
-                path = Path(self.CACHE_DIR) / hash
+                path = Path(self.CACHE_DIR) / cache_meta.hash
                 if not path.is_file():
                     # invalid cache entry found in the db, cleanup it
                     logger.error(f"dangling cache entry found: \n{cache_meta=}")
