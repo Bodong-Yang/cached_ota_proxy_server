@@ -154,42 +154,56 @@ class OTAFile:
         if not self._store_cache or not self._free_space_event:
             return
 
-        try:
-            logger.debug(f"start to cache for {self.url}...")
-            self._hash_f = sha256()
-            tmp_fpath = Path(self.base_path) / str(time.time()).replace(".", "")
-            self.temp_fpath = tmp_fpath
-            self._dst_fp = open(tmp_fpath, "wb")
+        logger.debug(f"start to cache for {self.url}...")
+        self._hash_f = sha256()
 
+        # use the sha256(url) as temp filename          
+        tmp_fpath = sha256(self.url.encode()).hexdigest()
+        cache_dst_fpath = Path(self.base_path) / tmp_fpath
+        if cache_dst_fpath.is_file():
+            logger.debug(f"on-going caching detected for {self.url=}, abort caching")
+            return
+        self._dst_fp = open(cache_dst_fpath, "wb")
+
+        try:
             while not self._finished or not self._queue.empty():
                 if not self._free_space_event.is_set():
                     # if the free space is not enough duing caching
                     # abort the caching
-                    logger.error(
+                    raise Exception(
                         f"not enough free space during caching url={self.url}, abort"
                     )
-                    break
 
                 try:
                     data = self._queue.get(timeout=360)
                 except Exception:
-                    logger.error(f"timeout caching for {self.url}, abort")
-                    break
+                    raise Exception(f"timeout caching for {self.url}, abort")
+
                 self._hash_f.update(data)
                 self.size += self._dst_fp.write(data)
 
-            self._dst_fp.close()
             if self._finished and self.size > 0:  # not caching 0 size file
-                # rename the file to the hash value
+                # rename the file to first 16bytes of hash
                 self.hash = self._hash_f.hexdigest()[:16]
-                self.temp_fpath.rename(Path(self.base_path) / self.hash)
+                self.cache_file = Path(self.base_path) / self.hash
+
+                self._dst_fp.close()
+                cache_dst_fpath.rename(self.cache_file)
                 self.cached_success = True
                 logger.debug(f"successfully cache {self.url}")
-            # NOTE: if queue is empty but self._finished is not set
-            # an unfinished caching might happen
+
+                # commit the cache
+                callback(self)
+            else:
+                # NOTE: if queue is empty but self._finished is not set
+                # an unfinished caching might happen
+                self.cached_success = False
+                cache_dst_fpath.unlink(missing_ok=True) # cleanup unfinished cache file
+                raise Exception(f"failed caching for {self.url}: unfinished cache detected")
+        except Exception as e:
+            logger.debug(f"failed caching for {self.url}: {e!r}")
         finally:
-            # execute the callback function
-            callback(self)
+            self._dst_fp.close()
 
     def __aiter__(self):
         return self
@@ -340,9 +354,6 @@ class OTACache:
                 content_encoding=f.content_encoding,
             )
             self._db.insert_urls(cache_meta)
-        else:
-            # try to cleanup the dangling cache file
-            Path(f.temp_fpath).unlink(missing_ok=True)
 
     def _find_target_bucket_size(self, file_size: int) -> int:
         if file_size < 0:
