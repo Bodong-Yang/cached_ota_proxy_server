@@ -190,22 +190,7 @@ class OTAFile:
 
 
 class OTACache:
-    CACHE_DIR = "/ota-cache"
-    DB_FILE = f"{CACHE_DIR}/cache_db"
-    DISK_USE_LIMIT_P = 70  # in p%
-    DISK_USE_PULL_INTERVAL = 2  # in seconds
-    BUCKET_FILE_SIZE_LIST = (
-        0,
-        10_240,  # 10KiB
-        102_400,  # 100KiB
-        512_000,  # 500KiB
-        1_048_576,  # 1MiB
-        5_242_880,  # 5MiB
-        10_485_760,  # 10MiB
-        104_857_600,  # 100MiB
-        1_048_576_000,  # 1GiB
-    )  # Bytes
-
+    
     def __init__(
         self,
         cache_enabled: bool,
@@ -227,13 +212,13 @@ class OTACache:
 
             # prepare cache dire
             if init:
-                shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
-            Path(self.CACHE_DIR).mkdir(exist_ok=True, parents=True)
+                shutil.rmtree(cfg.BASE_DIR, ignore_errors=True)
+            Path(cfg.BASE_DIR).mkdir(exist_ok=True, parents=True)
 
             # dispatch a background task to pulling the disk usage info
             self._executor.submit(self._background_check_free_space)
 
-            self._db = db.OTACacheDB(self.DB_FILE)
+            self._db = db.OTACacheDB(cfg.DB_FILE)
             # NOTE: requests doesn't decompress the contents,
             # we cache the contents as its original form, and send
             # to the client
@@ -257,33 +242,33 @@ class OTACache:
             self._db.close()
 
             if cleanup:
-                shutil.rmtree(self.CACHE_DIR, ignore_errors=True)
+                shutil.rmtree(cfg.BASE_DIR, ignore_errors=True)
         logger.info("shutdown ota-cache completed")
 
     def _background_check_free_space(self) -> bool:
         while not self._closed:
             try:
-                cmd = f"df --output=pcent {self.CACHE_DIR}"
+                cmd = f"df --output=pcent {cfg.BASE_DIR}"
                 current_used_p = _subprocess_check_output(cmd, raise_exception=True)
 
                 # expected output:
                 # 0: Use%
                 # 1: 33%
                 current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
-                if current_used_p < self.DISK_USE_LIMIT_P:
+                if current_used_p < cfg.DISK_USE_LIMIT_P:
                     self._enough_free_space_event.set()
                 else:
                     self._enough_free_space_event.clear()
             except Exception:
                 self._enough_free_space_event.clear()
 
-            time.sleep(self.DISK_USE_PULL_INTERVAL)
+            time.sleep(cfg.DISK_USE_PULL_INTERVAL)
 
     def _init_buckets(self):
         self._buckets: Dict[_Bucket] = dict()  # dict[file_size_target]_Bucket
 
-        for s in self.BUCKET_FILE_SIZE_LIST:
-            self._buckets[s] = _Bucket(size=s, cache_dir=self.CACHE_DIR)
+        for s in cfg.BUCKET_FILE_SIZE_LIST:
+            self._buckets[s] = _Bucket(size=s, cache_dir=cfg.BASE_DIR)
 
     def _register_cache_callback(self, f: OTAFile):
         """
@@ -312,11 +297,11 @@ class OTACache:
         if file_size < 0:
             raise ValueError(f"invalid file size {file_size}")
 
-        s, e = 0, len(self.BUCKET_FILE_SIZE_LIST) - 1
+        s, e = 0, len(cfg.BUCKET_FILE_SIZE_LIST) - 1
         target_size = None
 
-        if file_size >= self.BUCKET_FILE_SIZE_LIST[-1]:
-            target_size = self.BUCKET_FILE_SIZE_LIST[-1]
+        if file_size >= cfg.BUCKET_FILE_SIZE_LIST[-1]:
+            target_size = cfg.BUCKET_FILE_SIZE_LIST[-1]
         else:
             idx = None
             while True:
@@ -324,11 +309,11 @@ class OTACache:
                     idx = s
                     break
 
-                if file_size <= self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
+                if file_size <= cfg.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
                     e = (s + e) // 2
-                elif file_size > self.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
+                elif file_size > cfg.BUCKET_FILE_SIZE_LIST[(s + e) // 2]:
                     s = (s + e) // 2
-            target_size = self.BUCKET_FILE_SIZE_LIST[idx]
+            target_size = cfg.BUCKET_FILE_SIZE_LIST[idx]
 
         return target_size
 
@@ -345,8 +330,8 @@ class OTACache:
 
             else:  # if current bucket is not enough, check higher bucket
                 entry_to_clear = None
-                for bs in self.BUCKET_FILE_SIZE_LIST[
-                    self.BUCKET_FILE_SIZE_LIST.index(bs) + 1 :
+                for bs in cfg.BUCKET_FILE_SIZE_LIST[
+                    cfg.BUCKET_FILE_SIZE_LIST.index(bs) + 1 :
                 ]:
                     bucket = self._buckets[bs]
                     entry_to_clear = bucket.popleft()
@@ -355,7 +340,7 @@ class OTACache:
                     # get one entry from the target bucket
                     # and then delete it
 
-                    f: Path = Path(self.CACHE_DIR) / entry_to_clear
+                    f: Path = Path(cfg.BASE_DIR) / entry_to_clear
                     f.unlink(missing_ok=True)
                     self._db.remove_url_by_hash(entry_to_clear)
 
@@ -373,7 +358,7 @@ class OTACache:
 
     def _open_fp_by_cache(self, meta: db.CacheMeta) -> typing.BinaryIO:
         hash: str = meta.hash
-        fpath = Path(self.CACHE_DIR) / hash
+        fpath = Path(cfg.BASE_DIR) / hash
 
         if fpath.is_file():
             return open(fpath, "rb")
@@ -421,7 +406,7 @@ class OTACache:
             cache_meta = self._db.lookup_url(url)
             if cache_meta:  # cache hit
                 logger.debug(f"cache hit for {url=}\n, {cache_meta=}")
-                path = Path(self.CACHE_DIR) / cache_meta.hash
+                path = Path(cfg.BASE_DIR) / cache_meta.hash
                 if not path.is_file():
                     # invalid cache entry found in the db, cleanup it
                     logger.error(f"dangling cache entry found: \n{cache_meta=}")
