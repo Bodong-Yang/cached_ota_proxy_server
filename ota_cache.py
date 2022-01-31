@@ -36,7 +36,7 @@ def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
 
 
 class _Bucket(OrderedDict):
-    def __init__(self, size: int, cache_dir: str):
+    def __init__(self, size: int):
         super().__init__()
         self._lock = Lock()
         self.size = size
@@ -206,6 +206,7 @@ class OTACache:
         self._executor = ThreadPoolExecutor()
 
         self._enough_free_space_event = Event()
+        self._on_going_caching = dict()
 
         if cache_enabled:
             self._cache_enabled = True
@@ -268,7 +269,7 @@ class OTACache:
         self._buckets: Dict[_Bucket] = dict()  # dict[file_size_target]_Bucket
 
         for s in cfg.BUCKET_FILE_SIZE_LIST:
-            self._buckets[s] = _Bucket(size=s, cache_dir=cfg.BASE_DIR)
+            self._buckets[s] = _Bucket(s)
 
     def _register_cache_callback(self, f: OTAFile):
         """
@@ -292,6 +293,9 @@ class OTACache:
         else:
             # try to cleanup the dangling cache file
             Path(f.temp_fpath).unlink(missing_ok=True)
+
+        # always remember to remove url in the on_going_cache_list!
+        del self._on_going_caching[meta.url]
 
     def _find_target_bucket_size(self, file_size: int) -> int:
         if file_size < 0:
@@ -395,10 +399,10 @@ class OTACache:
             raise ValueError("ota cache pool is closed")
 
         res = None
-        if not self._cache_enabled:
+        # NOTE: also check if there is already an on-going caching
+        if not self._cache_enabled or url in self._on_going_caching:
             # case 1: not using cache, directly download file
             fp, meta = self._open_fp_by_requests(url)
-
             res = OTAFile(url=url, fp=fp, meta=meta)
         else:
             no_cache_available = True
@@ -420,6 +424,9 @@ class OTACache:
                 # case 2: download and cache new file
                 logger.debug(f"try to download and cache {url=}")
                 fp, meta = self._open_fp_by_requests(url)
+                # NOTE: remember to remove the url after cache comitted!
+                self._on_going_caching[url] = None
+
                 res = OTAFile(
                     url=url,
                     fp=fp,
