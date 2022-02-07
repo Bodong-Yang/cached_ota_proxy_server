@@ -69,11 +69,10 @@ class OTACacheDB:
 
     def _connect_db(self, init: bool):
         if init:
+            # remove the old db file if needed
             Path(self._db_file).unlink(missing_ok=True)
-            self._con = sqlite3.connect(self._db_file, check_same_thread=False)
-            self._init_table()
-        else:
-            self._con = sqlite3.connect(self._db_file, check_same_thread=False)
+
+        self._con = sqlite3.connect(self._db_file, check_same_thread=False)
 
         # check if the table exists
         cur = self._con.cursor()
