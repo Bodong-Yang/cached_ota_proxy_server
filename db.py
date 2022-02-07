@@ -100,7 +100,7 @@ class OTACacheDB:
         if self._closed:
             raise sqlite3.OperationalError("connect is closed")
 
-        url_list = [(u, ) for u in urls]
+        url_list = [(u,) for u in urls]
         with self._wlock:
             cur = self._con.cursor()
             cur.executemany(f"DELETE FROM {self.TABLE_NAME} WHERE url=?", url_list)

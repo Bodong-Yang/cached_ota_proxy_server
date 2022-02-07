@@ -1,5 +1,5 @@
 import asyncio
-import requests
+import aiohttp
 import subprocess
 import shlex
 import shutil
@@ -11,7 +11,7 @@ from queue import Queue
 from hashlib import sha256
 from http import HTTPStatus
 from threading import Lock, Event
-from typing import Dict
+from typing import Dict, Union
 from pathlib import Path
 from os import urandom
 
@@ -96,7 +96,7 @@ class OTAFile:
     def __init__(
         self,
         url: str,
-        fp: typing.BinaryIO,
+        fp: Union[aiohttp.ClientResponse, typing.BinaryIO],
         meta: db.CacheMeta,
         store_cache: bool = False,
         free_space_event: Event = None,
@@ -108,6 +108,10 @@ class OTAFile:
         self.meta = meta
 
         # data stream
+        self._remote = False
+        if isinstance(fp, aiohttp.ClientResponse):
+            self._remote = True
+
         self._fp = fp
         self._queue = None
 
@@ -166,11 +170,17 @@ class OTAFile:
     def __aiter__(self):
         return self
 
+    async def _get_chunk(self) -> bytes:
+        if self._remote:
+            return await self._fp.content.read(cfg.CHUNK_SIZE)
+        else:
+            return self._fp.read(cfg.CHUNK_SIZE)
+
     async def __anext__(self) -> bytes:
         if self.finished:
             raise ValueError("file is closed")
 
-        chunk = self._fp.read(cfg.CHUNK_SIZE)
+        chunk = await self._get_chunk()
         if len(chunk) == 0:  # stream finished
             self.finished = True
             # finish the background cache writing
@@ -190,7 +200,6 @@ class OTAFile:
 
 
 class OTACache:
-    
     def __init__(
         self,
         cache_enabled: bool,
@@ -223,19 +232,20 @@ class OTACache:
             # NOTE: requests doesn't decompress the contents,
             # we cache the contents as its original form, and send
             # to the client
-            self._session = requests.Session()
             if upper_proxy:
-                # override the proxy setting if we configure one
-                proxies = {"http": upper_proxy, "https": ""}
-                self._session.proxies.update(proxies)
+                self._session = aiohttp.ClientSession(
+                    auto_decompress=False, proxy=upper_proxy
+                )
                 # if upper proxy presented, we must disable https
                 self._enable_https = False
+            else:
+                self._session = aiohttp.ClientSession(auto_decompress=False)
 
             self._init_buckets()
         else:
             self._cache_enabled = False
 
-    def close(self, cleanup: bool = False):
+    def close(self, cleanup: bool = True):
         logger.debug(f"shutdown ota-cache({cleanup=})...")
         if self._cache_enabled and not self._closed:
             self._closed = True
@@ -366,15 +376,15 @@ class OTACache:
         if fpath.is_file():
             return open(fpath, "rb")
 
-    def _open_fp_by_requests(
+    async def _open_fp_by_requests(
         self, raw_url: str
-    ) -> typing.Tuple[typing.BinaryIO, db.CacheMeta]:
+    ) -> typing.Tuple[aiohttp.ClientResponse, db.CacheMeta]:
         url = raw_url
         if self._enable_https:
             url = raw_url.replace("http", "https")
 
-        response = self._session.get(url, stream=True)
-        if response.status_code != HTTPStatus.OK:
+        response = await self._session.get(url)
+        if response.status != HTTPStatus.OK:
             return
 
         # assembling output cachemeta
@@ -384,16 +394,15 @@ class OTACache:
         )
 
         meta.content_type = response.headers.get(
-            "Content-Type", "application/octet-stream"
+            "content-type", "application/octet-stream"
         )
-        meta.content_encoding = response.headers.get("Content-Encoding", "")
+        meta.content_encoding = response.headers.get("content-encoding", "")
 
-        # return the raw urllib3.response.HTTPResponse and a new CacheMeta instance
-        return response.raw, meta
+        # return the raw response and a new CacheMeta instance
+        return response, meta
 
     # exposed API
     async def retrieve_file(self, url: str) -> OTAFile:
-        logger.debug(f"try to retrieve file from {url=}")
         if self._closed:
             raise ValueError("ota cache pool is closed")
 
@@ -401,7 +410,7 @@ class OTACache:
         # NOTE: also check if there is already an on-going caching
         if not self._cache_enabled or url in self._on_going_caching:
             # case 1: not using cache, directly download file
-            fp, meta = self._open_fp_by_requests(url)
+            fp, meta = await self._open_fp_by_requests(url)
             res = OTAFile(url=url, fp=fp, meta=meta)
         else:
             no_cache_available = True
@@ -422,7 +431,7 @@ class OTACache:
             if no_cache_available:
                 # case 2: download and cache new file
                 logger.debug(f"try to download and cache {url=}")
-                fp, meta = self._open_fp_by_requests(url)
+                fp, meta = await self._open_fp_by_requests(url)
                 # NOTE: remember to remove the url after cache comitted!
                 self._on_going_caching[url] = None
 
