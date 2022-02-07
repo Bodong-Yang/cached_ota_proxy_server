@@ -13,6 +13,7 @@ from http import HTTPStatus
 from threading import Lock, Event
 from typing import Dict
 from pathlib import Path
+from os import urandom
 
 from . import db
 from .config import config as cfg
@@ -125,9 +126,8 @@ class OTAFile:
 
         try:
             logger.debug(f"start to cache for {self.meta.url}...")
-            tmp_fpath = Path(cfg.BASE_DIR) / str(time.time()).replace(".", "")
-            self.temp_fpath = tmp_fpath
-            self._dst_fp = open(tmp_fpath, "wb")
+            self.temp_fpath = Path(cfg.BASE_DIR) / f"tmp_{urandom(16).hex()}"
+            self._dst_fp = open(self.temp_fpath, "wb")
 
             while not self.finished or not self._queue.empty():
                 if not self._free_space_event.is_set():
@@ -150,7 +150,7 @@ class OTAFile:
             self._dst_fp.close()
             if self.finished and self.meta.size > 0:  # not caching 0 size file
                 # rename the file to the hash value
-                hash = self._hash_f.hexdigest()[:16]
+                hash = self._hash_f.hexdigest()
 
                 self.meta.hash = hash
                 self.temp_fpath.rename(Path(cfg.BASE_DIR) / hash)
