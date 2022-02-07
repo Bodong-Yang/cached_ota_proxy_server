@@ -65,7 +65,7 @@ class _Bucket(OrderedDict):
         enough_space = False
         with self._lock:
             hash_list, files_list = [], []
-            space_available = None
+            space_available = 0
             for h in self:
                 if space_available >= size:
                     break
@@ -76,6 +76,8 @@ class _Bucket(OrderedDict):
                         space_available += f.stat().st_size
                         hash_list.append(h)
                         files_list.append(f)
+                    else:
+                        logger.warning(f"dangling cache entry found: {h}")
 
             if space_available >= size:
                 enough_space = True
@@ -87,8 +89,6 @@ class _Bucket(OrderedDict):
             for f in files_list:
                 f.unlink(missing_ok=True)
             return hash_list
-
-        return
 
 
 class OTAFile:
@@ -322,36 +322,35 @@ class OTACache:
         return target_size
 
     def _ensure_free_space(self, size: int) -> bool:
-        if not self._enough_free_space_event.is_set():  # no enough free space
-            bs = self._find_target_bucket_size(size)
-            bucket: _Bucket = self._buckets[bs]
-
-            # first check the current bucket
-            hash_list = bucket.reserve_space(size)
-            if hash_list:
-                self._db.remove_url_by_hash(*hash_list)
-                return True
-
-            else:  # if current bucket is not enough, check higher bucket
-                entry_to_clear = None
-                for bs in cfg.BUCKET_FILE_SIZE_LIST[
-                    cfg.BUCKET_FILE_SIZE_LIST.index(bs) + 1 :
-                ]:
-                    bucket = self._buckets[bs]
-                    entry_to_clear = bucket.popleft()
-
-                if entry_to_clear:
-                    # get one entry from the target bucket
-                    # and then delete it
-
-                    f: Path = Path(cfg.BASE_DIR) / entry_to_clear
-                    f.unlink(missing_ok=True)
-                    self._db.remove_url_by_hash(entry_to_clear)
-
-                    return True
-
-        else:  # there is already enough space
+        if self._enough_free_space_event.is_set():
             return True
+
+        bs = self._find_target_bucket_size(size)
+        bucket: _Bucket = self._buckets[bs]
+
+        # first check the current bucket
+        hash_list = bucket.reserve_space(size)
+        if hash_list:
+            self._db.remove_url_by_hash(*hash_list)
+            return True
+
+        else:  # if current bucket is not enough, check higher bucket
+            entry_to_clear = None
+            for bs in cfg.BUCKET_FILE_SIZE_LIST[
+                cfg.BUCKET_FILE_SIZE_LIST.index(bs) + 1 :
+            ]:
+                bucket = self._buckets[bs]
+                entry_to_clear = bucket.popleft()
+
+            if entry_to_clear:
+                # get one entry from the target bucket
+                # and then delete it
+
+                f: Path = Path(cfg.BASE_DIR) / entry_to_clear
+                f.unlink(missing_ok=True)
+                self._db.remove_url_by_hash(entry_to_clear)
+
+                return True
 
         return False
 
