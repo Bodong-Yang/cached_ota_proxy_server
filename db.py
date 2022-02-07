@@ -88,21 +88,23 @@ class OTACacheDB:
         if self._closed:
             raise sqlite3.OperationalError("connect is closed")
 
+        hash_list = [(h,) for h in hash]
         with self._wlock:
             cur = self._con.cursor()
-            cur.executemany(f"DELETE FROM {self.TABLE_NAME} WHERE hash=?", hash)
+            cur.executemany(f"DELETE FROM {self.TABLE_NAME} WHERE hash=?", hash_list)
 
             self._con.commit()
             cur.close()
         return
 
-    def remove_urls(self, *urls):
+    def remove_urls(self, *urls: str):
         if self._closed:
             raise sqlite3.OperationalError("connect is closed")
 
+        url_list = [(u, ) for u in urls]
         with self._wlock:
             cur = self._con.cursor()
-            cur.executemany(f"DELETE FROM {self.TABLE_NAME} WHERE url=?", urls)
+            cur.executemany(f"DELETE FROM {self.TABLE_NAME} WHERE url=?", url_list)
 
             self._con.commit()
             cur.close()
