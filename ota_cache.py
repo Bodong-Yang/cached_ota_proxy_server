@@ -1,17 +1,16 @@
 import asyncio
+from functools import partial
 import aiohttp
 import subprocess
 import shlex
 import shutil
 import time
-import typing
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from queue import Queue
 from hashlib import sha256
-from http import HTTPStatus
 from threading import Lock, Event
-from typing import Dict, Union
+from typing import Dict, List, Union, Tuple, BinaryIO
 from pathlib import Path
 from os import urandom
 
@@ -21,6 +20,7 @@ from .config import config as cfg
 import logging
 
 logger = logging.getLogger(__name__)
+logger.setLevel(cfg.LOG_LEVEL)
 
 
 def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
@@ -39,6 +39,7 @@ def _subprocess_check_output(cmd: str, *, raise_exception=False) -> str:
 class _Bucket(OrderedDict):
     def __init__(self, size: int):
         super().__init__()
+        self._base_dir = Path(cfg.BASE_DIR)
         self._lock = Lock()
         self.size = size
 
@@ -71,13 +72,15 @@ class _Bucket(OrderedDict):
                 if space_available >= size:
                     break
                 else:
-                    f: Path = Path(cfg.BASE_DIR) / h
+                    f: Path = Path(self._base_dir) / h
                     if f.is_file():
-                        # TODO: deal with dangling cache?
                         space_available += f.stat().st_size
                         hash_list.append(h)
                         files_list.append(f)
                     else:
+                        # deal with dangling cache by telling the caller also
+                        # delete the dangling entry from the database
+                        hash_list.append(h)
                         logger.warning(f"dangling cache entry found: {h}")
 
             if space_available >= size:
@@ -96,14 +99,15 @@ class OTAFile:
     def __init__(
         self,
         url: str,
-        fp: Union[aiohttp.ClientResponse, typing.BinaryIO],
+        fp: Union[aiohttp.ClientResponse, BinaryIO],
         meta: db.CacheMeta,
         store_cache: bool = False,
-        free_space_event: Event = None,
+        below_hard_limit_event: Event = None,
     ):
         logger.debug(f"new OTAFile request: {url}")
+        self._base_dir = Path(cfg.BASE_DIR)
         self._store_cache = store_cache
-        self._free_space_event = free_space_event
+        self._storage_below_hard_limit = below_hard_limit_event
         # NOTE: for new cache entry meta, the hash and size are not set yet
         self.meta = meta
 
@@ -125,19 +129,21 @@ class OTAFile:
             self._queue = Queue()
 
     def background_write_cache(self, callback):
-        if not self._store_cache or not self._free_space_event:
+        if not self._store_cache or not self._storage_below_hard_limit:
+            # call callback function even we don't cache anything
+            # as we need to cleanup the status
+            callback(self)
             return
 
         try:
             logger.debug(f"start to cache for {self.meta.url}...")
-            self.temp_fpath = Path(cfg.BASE_DIR) / f"tmp_{urandom(16).hex()}"
+            self.temp_fpath = self._base_dir / f"tmp_{urandom(16).hex()}"
             self._dst_fp = open(self.temp_fpath, "wb")
 
             while not self.finished or not self._queue.empty():
-                if not self._free_space_event.is_set():
-                    # if the free space is not enough duing caching
-                    # abort the caching
-                    logger.error(
+                if not self._storage_below_hard_limit.is_set():
+                    # reach storage hard limit, abort caching
+                    logger.debug(
                         f"not enough free space during caching url={self.meta.url}, abort"
                     )
                     break
@@ -157,7 +163,7 @@ class OTAFile:
                 hash = self._hash_f.hexdigest()
 
                 self.meta.hash = hash
-                self.temp_fpath.rename(Path(cfg.BASE_DIR) / hash)
+                self.temp_fpath.rename(self._base_dir / hash)
                 self.cached_success = True
                 logger.debug(f"successfully cache {self.meta.url}")
             # NOTE: if queue is empty but self._finished is not set
@@ -185,10 +191,13 @@ class OTAFile:
             self.finished = True
             # finish the background cache writing
             if self._store_cache:
-                self._queue.put(b"")
+                self._queue.put_nowait(b"")
 
             # cleanup
-            self._fp.close()
+            if not self._remote:
+                self._fp.close()
+            else:
+                self._fp.release()
 
             raise StopAsyncIteration
         else:
@@ -197,6 +206,80 @@ class OTAFile:
                 self._queue.put_nowait(chunk)
 
             return chunk
+
+
+class OTACacheHelper:
+    """
+    a helper bundle to maintain ota-cache
+    """
+
+    def __init__(self, event: Event):
+        self._base_dir = Path(cfg.BASE_DIR)
+        self._db = db.OTACacheDB(cfg.DB_FILE)
+
+        self._event = event
+
+    @staticmethod
+    def _check_entry(base_dir: str, meta: db.CacheMeta) -> List[db.CacheMeta, bool]:
+        f = Path(base_dir) / meta.hash
+        if f.is_file():
+            hash_f = sha256()
+            # calculate file's hash and check against meta
+            with open(f, "rb") as fp:
+                while True:
+                    data = fp.read(cfg.CHUNK_SIZE)
+                    if data:
+                        hash_f.update(data)
+                    else:
+                        break
+
+            if hash_f.hexdigest() == meta.hash:
+                return meta, True
+
+        # check failed, try to remove the cache entry
+        f.unlink(missing_ok=True)
+        return meta, False
+
+    def scrub_cache(self):
+        from os import cpu_count
+
+        logger.debug("start to scrub the cache entries...")
+
+        if self._event.is_set():
+            self._event.clear()
+
+        dangling_db_entry = []
+        # NOTE: pre-add database file into the set
+        # to prevent db file being deleted
+        valid_cache_entry = {Path(cfg.DB_FILE).name}
+        with ProcessPoolExecutor(max_workers=cpu_count * 2 // 3) as pool:
+            res_list = pool.map(
+                partial(self._check_entry, str(self._base_dir)),
+                self._db.lookup_all(),
+                chunksize=128,
+            )
+
+            for meta, valid in res_list:
+                if not valid:
+                    logger.debug(f"invalid db entry found: {meta.url}")
+                    dangling_db_entry.append(meta.url)
+                else:
+                    valid_cache_entry.add(meta.hash)
+
+        # delete the invalid entry from the database
+        self._db.remove_urls(*dangling_db_entry)
+
+        # loop over all files under cache folder,
+        # if entry's hash is not presented in the valid_cache_entry set,
+        # we treat it as dangling cache entry and delete it
+        for entry in self._base_dir.glob("*"):
+            if entry.name not in valid_cache_entry:
+                logger.debug(f"dangling cache entry found: {entry.name}")
+                f = self._base_dir / entry.name
+                f.unlink(missing_ok=True)
+
+        self._event.set()
+        logger.debug("scrub finished")
 
 
 class OTACache:
@@ -209,69 +292,99 @@ class OTACache:
     ):
         logger.debug(f"init ota cache({cache_enabled=}, {init=}, {upper_proxy=})")
 
+        self._base_dir = Path(cfg.BASE_DIR)
         self._closed = False
         self._cache_enabled = cache_enabled
         self._enable_https = enable_https
         self._executor = ThreadPoolExecutor()
 
-        self._enough_free_space_event = Event()
+        self._storage_below_hard_limit_event = Event()
+        self._storage_below_soft_limit_event = Event()
         self._on_going_caching = dict()
+        self._upper_proxy: str = ""
+
+        _event = Event()
+        self._scrub_finished_event = _event
+        self._cache_helper = OTACacheHelper(_event)
 
         if cache_enabled:
             self._cache_enabled = True
 
             # prepare cache dire
             if init:
-                shutil.rmtree(cfg.BASE_DIR, ignore_errors=True)
-            Path(cfg.BASE_DIR).mkdir(exist_ok=True, parents=True)
+                shutil.rmtree(str(self._base_dir), ignore_errors=True)
+                self._base_dir.mkdir(exist_ok=True, parents=True)
+            else:
+                # scrub the cache folder in the background
+                self._base_dir.mkdir(exist_ok=True, parents=True)
+                self._executor.submit(self._cache_helper.scrub_cache)
 
             # dispatch a background task to pulling the disk usage info
             self._executor.submit(self._background_check_free_space)
 
+            # connect to db
             self._db = db.OTACacheDB(cfg.DB_FILE)
-            # NOTE: requests doesn't decompress the contents,
-            # we cache the contents as its original form, and send
-            # to the client
+
             if upper_proxy:
-                self._session = aiohttp.ClientSession(
-                    auto_decompress=False, proxy=upper_proxy
-                )
                 # if upper proxy presented, we must disable https
+                self._upper_proxy = upper_proxy
                 self._enable_https = False
-            else:
-                self._session = aiohttp.ClientSession(auto_decompress=False)
+
+            # NOTE: we configure aiohttp to not decompress the contents,
+            # we cache the contents as its original form, and send
+            # to the client with proper headers to indicate the client to
+            # compress the payload by their own
+            self._session = aiohttp.ClientSession(
+                auto_decompress=False, raise_for_status=True
+            )
 
             self._init_buckets()
         else:
             self._cache_enabled = False
 
-    def close(self, cleanup: bool = True):
-        logger.debug(f"shutdown ota-cache({cleanup=})...")
+    def close(self):
+        logger.debug("shutdown ota-cache...")
         if self._cache_enabled and not self._closed:
             self._closed = True
             self._executor.shutdown(wait=True)
             self._db.close()
 
-            if cleanup:
-                shutil.rmtree(cfg.BASE_DIR, ignore_errors=True)
         logger.info("shutdown ota-cache completed")
 
-    def _background_check_free_space(self) -> bool:
+    def _background_check_free_space(self):
         while not self._closed:
             try:
-                cmd = f"df --output=pcent {cfg.BASE_DIR}"
+                cmd = f"df --output=pcent {self._base_dir}"
                 current_used_p = _subprocess_check_output(cmd, raise_exception=True)
 
                 # expected output:
                 # 0: Use%
                 # 1: 33%
                 current_used_p = int(current_used_p.splitlines()[-1].strip(" %"))
-                if current_used_p < cfg.DISK_USE_LIMIT_P:
-                    self._enough_free_space_event.set()
+                if current_used_p < cfg.DISK_USE_LIMIT_SOTF_P:
+                    logger.debug(f"storage usage below soft limit: {current_used_p}")
+                    # below soft limit, normal caching mode
+                    self._storage_below_soft_limit_event.set()
+                    self._storage_below_hard_limit_event.set()
+                elif (
+                    current_used_p >= cfg.DISK_USE_LIMIT_SOTF_P
+                    and current_used_p < cfg.DISK_USE_LIMIT_HARD_P
+                ):
+                    logger.debug(f"storage usage below hard limit: {current_used_p}")
+                    # reach soft limit but not reach hard limit
+                    # space reservation will be triggered after new file cached
+                    self._storage_below_soft_limit_event.clear()
+                    self._storage_below_hard_limit_event.set()
                 else:
-                    self._enough_free_space_event.clear()
-            except Exception:
-                self._enough_free_space_event.clear()
+                    logger.debug(f"storage usage reach hard limit: {current_used_p}")
+                    # reach hard limit
+                    # totally disable caching
+                    self._storage_below_soft_limit_event.clear()
+                    self._storage_below_hard_limit_event.clear()
+            except Exception as e:
+                logger.warning(f"background free space check failed: {e!r}")
+                self._storage_below_soft_limit_event.clear()
+                self._storage_below_hard_limit_event.clear()
 
             time.sleep(cfg.DISK_USE_PULL_INTERVAL)
 
@@ -280,6 +393,14 @@ class OTACache:
 
         for s in cfg.BUCKET_FILE_SIZE_LIST:
             self._buckets[s] = _Bucket(s)
+
+    def _commit_cache(self, m: db.CacheMeta):
+        logger.debug(f"commit cache for {m.url}...")
+        bs = self._find_target_bucket_size(m.size)
+        self._buckets[bs].add_entry(m.hash)
+
+        # register to the database
+        self._db.insert_urls(m)
 
     def _register_cache_callback(self, f: OTAFile):
         """
@@ -292,16 +413,26 @@ class OTACache:
         we will first try reserving free space, if fails,
         then we delete the already cached file.
         """
-        meta = f.meta
-        if f.cached_success and self._ensure_free_space(meta.size):
-            logger.debug(f"commit cache for {meta.url}...")
-            bs = self._find_target_bucket_size(meta.size)
-            self._buckets[bs].add_entry(meta.hash)
 
-            # register to the database
-            self._db.insert_urls(meta)
+        meta = f.meta
+        if f.cached_success:
+            logger.debug(
+                f"caching successfully for {meta.url=}, try to commit cache..."
+            )
+            if not self._storage_below_soft_limit_event.is_set():
+                if self._ensure_free_space(meta.size):
+                    self._commit_cache(meta)
+                else:
+                    # failed to reserve space,
+                    # cleanup cache file
+                    logger.debug(f"failed to reserve space for {meta.url=}, cleanup")
+                    Path(f.temp_fpath).unlink(missing_ok=True)
+            else:
+                self._commit_cache(meta)
         else:
-            # try to cleanup the dangling cache file
+            # cache failed,
+            # cleanup dangling cache file
+            logger.debug(f"cache for {meta.url=} failed, cleanup")
             Path(f.temp_fpath).unlink(missing_ok=True)
 
         # always remember to remove url in the on_going_cache_list!
@@ -332,9 +463,6 @@ class OTACache:
         return target_size
 
     def _ensure_free_space(self, size: int) -> bool:
-        if self._enough_free_space_event.is_set():
-            return True
-
         bs = self._find_target_bucket_size(size)
         bucket: _Bucket = self._buckets[bs]
 
@@ -355,8 +483,7 @@ class OTACache:
             if entry_to_clear:
                 # get one entry from the target bucket
                 # and then delete it
-
-                f: Path = Path(cfg.BASE_DIR) / entry_to_clear
+                f = self._base_dir / entry_to_clear
                 f.unlink(missing_ok=True)
                 self._db.remove_url_by_hash(entry_to_clear)
 
@@ -369,28 +496,37 @@ class OTACache:
         bucket: _Bucket = self._buckets[bs]
         bucket.warm_up_entry(cache_meta.hash)
 
-    def _open_fp_by_cache(self, meta: db.CacheMeta) -> typing.BinaryIO:
+    def _open_fp_by_cache(self, meta: db.CacheMeta) -> BinaryIO:
         hash: str = meta.hash
-        fpath = Path(cfg.BASE_DIR) / hash
+        fpath = self._base_dir / hash
 
         if fpath.is_file():
             return open(fpath, "rb")
 
     async def _open_fp_by_requests(
-        self, raw_url: str
-    ) -> typing.Tuple[aiohttp.ClientResponse, db.CacheMeta]:
-        url = raw_url
-        if self._enable_https:
-            url = raw_url.replace("http", "https")
+        self, raw_url: str, cookies: Dict[str, str], extra_headers: Dict[str, str]
+    ) -> Tuple[aiohttp.ClientResponse, db.CacheMeta]:
+        from urllib.parse import quote, urlparse
 
-        response = await self._session.get(url)
-        if response.status != HTTPStatus.OK:
-            return
+        url_parsed = urlparse(raw_url)
+
+        # NOTE: raw_url is unquoted, we must quote it again before we send it to the remote
+        url_parsed = url_parsed._replace(path=quote(url_parsed.path))
+        if self._enable_https:
+            url_parsed = url_parsed._replace(scheme="https")
+
+        url = url_parsed.geturl()
+
+        response = await self._session.get(
+            url, proxy=self._upper_proxy, cookies=cookies, headers=extra_headers
+        )
+        response.raise_for_status()
 
         # assembling output cachemeta
         # NOTE: output cachemeta doesn't have hash and size set yet
+        # NOTE.2: store the original unquoted url into the CacheMeta
         meta = db.CacheMeta(
-            url=url, hash=None, content_encoding=None, content_type=None, size=0
+            url=raw_url, hash=None, content_encoding=None, content_type=None, size=0
         )
 
         meta.content_type = response.headers.get(
@@ -402,15 +538,22 @@ class OTACache:
         return response, meta
 
     # exposed API
-    async def retrieve_file(self, url: str) -> OTAFile:
+    async def retrieve_file(
+        self, url: str, cookies: Dict[str, str], extra_headers: Dict[str, str]
+    ) -> OTAFile:
         if self._closed:
             raise ValueError("ota cache pool is closed")
 
         res = None
         # NOTE: also check if there is already an on-going caching
-        if not self._cache_enabled or url in self._on_going_caching:
+        # NOTE.2: disable caching when scrubbing is on-going
+        if (
+            not self._cache_enabled
+            or url in self._on_going_caching
+            or not self._scrub_finished_event.is_set()
+        ):
             # case 1: not using cache, directly download file
-            fp, meta = await self._open_fp_by_requests(url)
+            fp, meta = await self._open_fp_by_requests(url, cookies, extra_headers)
             res = OTAFile(url=url, fp=fp, meta=meta)
         else:
             no_cache_available = True
@@ -418,7 +561,7 @@ class OTACache:
             cache_meta = self._db.lookup_url(url)
             if cache_meta:  # cache hit
                 logger.debug(f"cache hit for {url=}\n, {cache_meta=}")
-                path = Path(cfg.BASE_DIR) / cache_meta.hash
+                path = self._base_dir / cache_meta.hash
                 if not path.is_file():
                     # invalid cache entry found in the db, cleanup it
                     logger.error(f"dangling cache entry found: \n{cache_meta=}")
@@ -431,7 +574,7 @@ class OTACache:
             if no_cache_available:
                 # case 2: download and cache new file
                 logger.debug(f"try to download and cache {url=}")
-                fp, meta = await self._open_fp_by_requests(url)
+                fp, meta = await self._open_fp_by_requests(url, cookies, extra_headers)
                 # NOTE: remember to remove the url after cache comitted!
                 self._on_going_caching[url] = None
 
@@ -440,7 +583,7 @@ class OTACache:
                     fp=fp,
                     meta=meta,
                     store_cache=True,
-                    free_space_event=self._enough_free_space_event,
+                    below_hard_limit_event=self._storage_below_hard_limit_event,
                 )
 
                 # dispatch the background cache writing to executor
