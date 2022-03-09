@@ -16,11 +16,18 @@ logger.setLevel(cfg.LOG_LEVEL)
 class _CacheMetaMixin:
     _cols = cfg.COLUMNS
 
+    @classmethod
+    def shape(cls) -> int:
+        return len(cls._cols)
+
     def to_tuple(self) -> Tuple[Any]:
         return tuple([getattr(self, k) for k in self._cols])
 
     @classmethod
     def row_to_meta(cls, row: Dict[str, Any]):
+        if not row:
+            return
+
         res = cls()
         for k in cls._cols:
             setattr(res, k, row[k])
@@ -38,6 +45,8 @@ def make_cachemeta_cls(name: str):
 
 
 CacheMeta = make_cachemeta_cls("CacheMeta")
+# fix the issue of pickling dynamically generated dataclass
+CacheMeta.__module__ = __name__
 
 
 class OTACacheDB:
@@ -48,7 +57,7 @@ class OTACacheDB:
         + ")"
     )
 
-    def __init__(self, db_file: str, init: bool = False):
+    def __init__(self, db_file: str, init=False):
         logger.debug("init database...")
         self._db_file = db_file
         self._wlock = Lock()
@@ -57,7 +66,7 @@ class OTACacheDB:
         self._connect_db(init)
 
     @contextmanager
-    def _general_query(self, query: str, query_param: List[Any], init: bool = False):
+    def _general_query(self, query: str, query_param: List[Any], /, *, init=False):
         if not init and self._closed:
             raise sqlite3.OperationalError("connect is closed")
 
@@ -118,8 +127,9 @@ class OTACacheDB:
 
     def insert_urls(self, *cache_meta: CacheMeta):
         rows = [m.to_tuple() for m in cache_meta]
+        _row_shape = ",".join(["?"] * CacheMeta.shape())
         with self._wlock, self._general_query(
-            f"INSERT OR REPLACE INTO {self.TABLE_NAME} VALUES (?,?,?,?,?)",
+            f"INSERT OR REPLACE INTO {self.TABLE_NAME} VALUES ({_row_shape})",
             rows,
         ):
             self._con.commit()

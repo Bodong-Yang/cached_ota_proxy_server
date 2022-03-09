@@ -19,10 +19,11 @@ __all__ = "App"
 class App:
     def __init__(
         self,
-        cache_enabled=False,
+        *,
         upper_proxy: str = None,
-        enable_https: bool = False,
-        init_cache: bool = True,
+        cache_enabled=False,
+        enable_https=False,
+        init_cache=True,
     ):
         self.cache_enabled = cache_enabled
         self.upper_proxy = upper_proxy
@@ -54,6 +55,7 @@ class App:
                 logger.info("stopping ota http proxy app...")
                 self._ota_cache.close()
                 logger.info("shutdown server completed")
+                self.started = False
             self._lock.release()
 
     @staticmethod
@@ -145,7 +147,7 @@ class App:
             await self._init_response(HTTPStatus.OK, headers, send)
 
             # stream the response to the client
-            async for chunk in f:
+            async for chunk in f.get_chunks():
                 await self._send_chunk(chunk, True, send)
             # finish the streaming by send a 0 len payload
             await self._send_chunk(b"", False, send)
