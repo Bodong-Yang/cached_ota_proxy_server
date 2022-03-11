@@ -181,12 +181,11 @@ class OTAFile:
             self._hash_f = sha256()
             self._queue: janus.Queue[int] = janus.Queue()
 
-    def background_write_cache(self, callback):
+    def background_write_cache(self):
         if not self._store_cache or not self._storage_below_hard_limit:
             # call callback function even we don't cache anything
             # as we need to cleanup the status
-            callback(self)
-            return
+            return self
 
         _queue = self._queue.sync_q
         try:
@@ -215,20 +214,24 @@ class OTAFile:
                         self.meta.size += dst_f.write(data)
 
             # post caching
-            if self.finished.is_set() and self.meta.size > 0:  # not caching 0 size file
+            if self.finished.is_set():
                 # rename the file to the hash value
                 hash = self._hash_f.hexdigest()
-
                 self.meta.hash = hash
-                self.temp_fpath.rename(self._base_dir / hash)
                 self.cached_success = True
-                logger.debug(f"successfully cached {self.meta.url}")
+
+                # for 0 size file, register the entry only
+                # but if the 0 size file doesn't exist, create one
+                if self.meta.size > 0 or not (self._base_dir / hash).is_file():
+                    logger.debug(f"successfully cached {self.meta.url}")
+                    self.temp_fpath.rename(self._base_dir / hash)
+                else:
+                    self.temp_fpath.unlink(missing_ok=True)
             # NOTE: if queue is empty but self._finished is not set,
             # it may indicate that an unfinished caching might happen
 
         finally:
-            # always remember to call callback
-            callback(self)
+            return self
 
     async def get_chunks(self) -> Iterator[bytes]:
         if self.finished.is_set():
@@ -256,8 +259,9 @@ class OTACacheHelper:
     def __init__(self, event: Event):
         self._base_dir = Path(cfg.BASE_DIR)
         self._db = db.OTACacheDB(cfg.DB_FILE)
-
+        self._excutor = ProcessPoolExecutor()
         self._event = event
+        self._closed = False
 
     @staticmethod
     def _check_entry(base_dir: str, meta: db.CacheMeta) -> Union[db.CacheMeta, bool]:
@@ -268,7 +272,7 @@ class OTACacheHelper:
             with open(f, "rb") as fp:
                 while True:
                     data = fp.read(cfg.CHUNK_SIZE)
-                    if data:
+                    if len(data) > 0:
                         hash_f.update(data)
                     else:
                         break
@@ -281,7 +285,8 @@ class OTACacheHelper:
         return meta, False
 
     def scrub_cache(self):
-        from os import cpu_count
+        if self._closed:
+            return
 
         logger.debug("start to scrub the cache entries...")
         self._event.clear()
@@ -290,19 +295,18 @@ class OTACacheHelper:
         # NOTE: pre-add database file into the set
         # to prevent db file being deleted
         valid_cache_entry = {Path(cfg.DB_FILE).name}
-        with ProcessPoolExecutor(max_workers=cpu_count() * 2 // 3) as pool:
-            res_list = pool.map(
-                partial(self._check_entry, str(self._base_dir)),
-                self._db.lookup_all(),
-                chunksize=128,
-            )
+        res_list = self._excutor.map(
+            partial(self._check_entry, str(self._base_dir)),
+            self._db.lookup_all(),
+            chunksize=256,
+        )
 
-            for meta, valid in res_list:
-                if not valid:
-                    logger.debug(f"invalid db entry found: {meta.url}")
-                    dangling_db_entry.append(meta.url)
-                else:
-                    valid_cache_entry.add(meta.hash)
+        for meta, valid in res_list:
+            if not valid:
+                logger.debug(f"invalid db entry found: {meta.url}")
+                dangling_db_entry.append(meta.url)
+            else:
+                valid_cache_entry.add(meta.hash)
 
         # delete the invalid entry from the database
         self._db.remove_urls(*dangling_db_entry)
@@ -316,7 +320,10 @@ class OTACacheHelper:
                 f = self._base_dir / entry.name
                 f.unlink(missing_ok=True)
 
+        # cleanup
         self._event.set()
+        self._excutor.shutdown(wait=True)
+        self._closed = True
         logger.debug("scrub finished")
 
 
@@ -344,9 +351,7 @@ class OTACache:
         self._upper_proxy: str = ""
 
         self._base_dir.mkdir(exist_ok=True, parents=True)
-        _event = Event()
-        self._scrub_finished_event = _event
-        self._cache_helper = OTACacheHelper(_event)
+        self._scrub_finished_event = Event()
 
         if cache_enabled:
             self._cache_enabled = True
@@ -361,7 +366,9 @@ class OTACache:
                 self._base_dir.mkdir(exist_ok=True, parents=True)
             else:
                 # scrub the cache folder in the background
-                self._executor.submit(self._cache_helper.scrub_cache)
+                # NOTE: the _cache_helper is only used once here
+                _cache_helper = OTACacheHelper(self._scrub_finished_event)
+                _cache_helper.scrub_cache()
 
             # dispatch a background task to pulling the disk usage info
             self._executor.submit(self._background_check_free_space)
@@ -438,7 +445,7 @@ class OTACache:
         # register to the database
         self._db.insert_urls(m)
 
-    def _register_cache_callback(self, f: OTAFile):
+    def _register_cache_callback(self, fut: asyncio.Future):
         """
         the callback for finishing up caching
 
@@ -449,6 +456,7 @@ class OTACache:
         we will first try reserving free space, if fails,
         then we delete the already cached file.
         """
+        f: OTAFile = fut.result()
 
         meta = f.meta
         if f.cached_success:
@@ -468,7 +476,10 @@ class OTACache:
         else:
             # cache failed,
             # cleanup dangling cache file
-            logger.debug(f"cache for {meta.url=} failed, cleanup")
+            if meta.size == 0:
+                logger.debug(f"skip caching 0 size file {meta.url=}")
+            else:
+                logger.debug(f"cache for {meta.url=} failed, cleanup")
             Path(f.temp_fpath).unlink(missing_ok=True)
 
         # always remember to remove url in the on_going_cache_list!
@@ -515,7 +526,7 @@ class OTACache:
                 async with aiofiles.open(fpath, "rb", executor=self._executor) as f:
                     while True:
                         data = await f.read(self._chunk_size)
-                        if data:
+                        if len(data) > 0:
                             yield data
                         else:
                             break
@@ -560,7 +571,7 @@ class OTACache:
         async def _fp():
             while True:
                 data = await response.content.read(self._chunk_size)
-                if data:
+                if len(data) > 0:
                     yield data
                 else:
                     break
@@ -616,17 +627,19 @@ class OTACache:
 
                     # dispatch the background cache writing to executor
                     loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
-                        self._executor,
-                        res.background_write_cache,
-                        self._register_cache_callback,
+                    fut = loop.run_in_executor(
+                        self._executor, res.background_write_cache
                     )
+                    fut.add_done_callback(self._register_cache_callback)
                 else:
                     # failed to get the chance to cache
+                    logger.debug(
+                        f"failed to get the chance to cache..., directly download {url=}"
+                    )
                     fp, meta = await self._open_fp_by_requests(
                         url, cookies, extra_headers
                     )
-                    res = OTAFile(url=url, fp=fp, meta=meta)
+                    res = OTAFile(url, meta, fp)
             else:
                 # case 3: use cache
                 logger.debug(f"use cache for {url=}")
