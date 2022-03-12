@@ -13,7 +13,7 @@ from hashlib import sha256
 from os import urandom
 from pathlib import Path
 from threading import Lock, Event
-from typing import Dict, Iterator, Union, Tuple
+from typing import Dict, AsyncIterator, Union, Tuple
 
 from . import db
 from .config import config as cfg
@@ -159,7 +159,7 @@ class OTAFile:
         self,
         url: str,
         meta: db.CacheMeta,
-        fp: Iterator[bytes],
+        fp: AsyncIterator[bytes],
         *,
         store_cache=False,
         below_hard_limit_event: Event = None,
@@ -173,8 +173,11 @@ class OTAFile:
         self._fp = fp
 
         # life cycle
-        self.finished: Event = Event()
+        self.closed: Event = (
+            Event()
+        )  # whether the fp finishes its work(successful or not)
         self.cached_success = False
+        self._cache_aborted: Event = Event()
 
         # prepare for data streaming
         if store_cache:
@@ -193,28 +196,30 @@ class OTAFile:
             self.temp_fpath = self._base_dir / f"tmp_{urandom(16).hex()}"
 
             with open(self.temp_fpath, "wb") as dst_f:
-                while not self.finished.is_set() or not _queue.empty():
+                while not self.closed.is_set() or not _queue.empty():
                     if not self._storage_below_hard_limit.is_set():
                         # reach storage hard limit, abort caching
                         logger.debug(
                             f"not enough free space during caching url={self.meta.url}, abort"
                         )
-                        # close the queue to indicate the streaming coro
+                        # signal the streaming coro
                         # to stop streaming to the caching thread
+                        self._cache_aborted.set()
                         self._queue.close()
                     else:
                         try:
-                            data = _queue.get(timeout=360)
+                            data = _queue.get(timeout=16)
+                            self._hash_f.update(data)
+                            self.meta.size += dst_f.write(data)
                         except Exception:
                             # streaming coro might be dead, abort
                             logger.error(f"timeout caching for {self.meta.url}, abort")
+                            self._cache_aborted.set()
+                            self._queue.close()
                             break
 
-                        self._hash_f.update(data)
-                        self.meta.size += dst_f.write(data)
-
             # post caching
-            if self.finished.is_set():
+            if self.closed.is_set() and not self._cache_aborted.is_set():
                 # rename the file to the hash value
                 hash = self._hash_f.hexdigest()
                 self.meta.hash = hash
@@ -233,22 +238,24 @@ class OTAFile:
         finally:
             return self
 
-    async def get_chunks(self) -> Iterator[bytes]:
-        if self.finished.is_set():
+    async def get_chunks(self) -> AsyncIterator[bytes]:
+        if self.closed.is_set():
             raise RuntimeError("file is closed")
 
-        async for chunk in self._fp:
-            # to caching thread
-            if self._store_cache:
-                _queue = self._queue.async_q
-                if not self._queue.closed:
-                    _queue.put_nowait(chunk)
+        try:
+            async for chunk in self._fp:
+                # to caching thread
+                if self._store_cache:
+                    _queue = self._queue.async_q
+                    if not self._cache_aborted.is_set():
+                        _queue.put_nowait(chunk)
 
-            # to uvicorn thread
-            yield chunk
+                # to uvicorn thread
+                yield chunk
 
-        # stream finished
-        self.finished.set()
+        finally:
+            # always close the file if get_chunk finished
+            self.closed.set()
 
 
 class OTACacheHelper:
@@ -298,7 +305,7 @@ class OTACacheHelper:
         res_list = self._excutor.map(
             partial(self._check_entry, str(self._base_dir)),
             self._db.lookup_all(),
-            chunksize=256,
+            chunksize=128,
         )
 
         for meta, valid in res_list:
@@ -338,7 +345,7 @@ class OTACache:
     ):
         logger.debug(f"init ota cache({cache_enabled=}, {init=}, {upper_proxy=})")
         self._chunk_size = cfg.CHUNK_SIZE
-
+        self._remote_chunk_size = cfg.REMOTE_CHUNK_SIZE
         self._base_dir = Path(cfg.BASE_DIR)
         self._closed = False
         self._cache_enabled = cache_enabled
@@ -516,7 +523,7 @@ class OTACache:
         bucket = self._buckets.get_bucket(cache_meta.size)
         bucket.warm_up_entry(cache_meta.hash)
 
-    async def _open_fp_by_cache(self, meta: db.CacheMeta) -> Iterator[bytes]:
+    async def _open_fp_by_cache(self, meta: db.CacheMeta) -> AsyncIterator[bytes]:
         hash: str = meta.hash
         fpath = self._base_dir / hash
 
@@ -532,10 +539,15 @@ class OTACache:
                             break
 
             return _fp()
+        else:
+            raise ValueError(f"cache entry {hash} doesn't exist!")
 
     async def _open_fp_by_requests(
         self, raw_url: str, cookies: Dict[str, str], extra_headers: Dict[str, str]
-    ) -> Tuple[Iterator[bytes], db.CacheMeta]:
+    ) -> Tuple[AsyncIterator[bytes], db.CacheMeta]:
+        """
+        NOTE: call next on the return generator to get the meta
+        """
         from urllib.parse import quote, urlparse
 
         url_parsed = urlparse(raw_url)
@@ -549,36 +561,31 @@ class OTACache:
 
         url = url_parsed.geturl()
 
-        response = await self._session.get(
-            url, proxy=self._upper_proxy, cookies=cookies, headers=extra_headers
-        )
-        response.raise_for_status()
-
-        # assembling output cachemeta
-        # NOTE: output cachemeta doesn't have hash and size set yet
-        # NOTE.2: store the original unquoted url into the CacheMeta
-        meta = db.CacheMeta(
-            url=raw_url,
-            hash=None,
-            size=0,
-            content_encoding=response.headers.get("content-encoding", ""),
-            content_type=response.headers.get(
-                "content-type", "application/octet-stream"
-            ),
-        )
-
-        # return an iterator of fp and a new CacheMeta instance
+        ###### wrap the request inside a generator ######
         async def _fp():
-            while True:
-                data = await response.content.read(self._chunk_size)
-                if len(data) > 0:
+            async with self._session.get(
+                url, proxy=self._upper_proxy, cookies=cookies, headers=extra_headers
+            ) as response:
+                # assembling output cachemeta
+                # NOTE: output cachemeta doesn't have hash and size set yet
+                # NOTE.2: store the original unquoted url into the CacheMeta
+                yield db.CacheMeta(
+                    url=raw_url,
+                    hash=None,
+                    size=0,
+                    content_encoding=response.headers.get("content-encoding", ""),
+                    content_type=response.headers.get(
+                        "content-type", "application/octet-stream"
+                    ),
+                )
+
+                async for data in response.content.iter_chunked(
+                    self._remote_chunk_size
+                ):
                     yield data
-                else:
-                    break
 
-            response.release()
-
-        return _fp(), meta
+        # return the generator
+        return _fp()
 
     # exposed API
     async def retrieve_file(
@@ -591,7 +598,8 @@ class OTACache:
         # NOTE: disable caching when scrubbing is on-going
         if not self._cache_enabled or not self._scrub_finished_event.is_set():
             # case 1: not using cache, directly download file
-            fp, meta = await self._open_fp_by_requests(url, cookies, extra_headers)
+            fp = await self._open_fp_by_requests(url, cookies, extra_headers)
+            meta = next(fp)
             res = OTAFile(url, meta, fp)
         else:
             no_cache_available = True
@@ -612,7 +620,8 @@ class OTACache:
             if no_cache_available:
                 # case 2: download and cache new file
                 logger.debug(f"try to download and cache {url=}")
-                fp, meta = await self._open_fp_by_requests(url, cookies, extra_headers)
+                fp = await self._open_fp_by_requests(url, cookies, extra_headers)
+                meta = next(fp)
 
                 # NOTE: remember to remove the url after cache comitted!
                 # try to cache the file if no other same on-going caching
@@ -636,9 +645,8 @@ class OTACache:
                     logger.debug(
                         f"failed to get the chance to cache..., directly download {url=}"
                     )
-                    fp, meta = await self._open_fp_by_requests(
-                        url, cookies, extra_headers
-                    )
+                    fp = await self._open_fp_by_requests(url, cookies, extra_headers)
+                    meta = next(fp)
                     res = OTAFile(url, meta, fp)
             else:
                 # case 3: use cache
